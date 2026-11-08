@@ -162,11 +162,61 @@ impl ApprovalBroadcaster for GatewayApprovalBroadcaster {
             BroadcastOpts::default(),
         )
         .await;
-        if let Err(error) = self.notify_origin_channel(session_key, command).await {
-            warn!(%error, session_key, request_id, "failed to notify originating channel about approval");
+        let delay = approval_notify_delay();
+        if delay.is_zero() {
+            if let Err(error) = self.notify_origin_channel(session_key, command).await {
+                warn!(%error, session_key, request_id, "failed to notify originating channel about approval");
+            }
+            return Ok(());
         }
+        // Home patch: give an external approval guard time to resolve the request
+        // before pinging the chat; skip the ping if it is no longer pending.
+        let broadcaster = Self::new(Arc::clone(&self.state));
+        let request_id = request_id.to_string();
+        let session_key = session_key.map(str::to_string);
+        let command = command.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if !broadcaster.is_pending(&request_id).await {
+                return;
+            }
+            if let Err(error) = broadcaster
+                .notify_origin_channel(session_key.as_deref(), &command)
+                .await
+            {
+                warn!(%error, request_id, "failed to notify originating channel about approval");
+            }
+        });
         Ok(())
     }
+}
+
+impl GatewayApprovalBroadcaster {
+    async fn is_pending(&self, request_id: &str) -> bool {
+        match self
+            .state
+            .services
+            .exec_approval
+            .request(serde_json::json!({}))
+            .await
+        {
+            Ok(value) => value
+                .get("pending")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(request_id))),
+            // When in doubt, still notify so a human can act.
+            Err(_) => true,
+        }
+    }
+}
+
+/// Home patch: seconds to wait before announcing an approval request in the
+/// originating channel (`MOLTIS_APPROVAL_NOTIFY_DELAY_SECS`, default 0 = immediately).
+fn approval_notify_delay() -> std::time::Duration {
+    std::env::var("MOLTIS_APPROVAL_NOTIFY_DELAY_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map_or(std::time::Duration::ZERO, std::time::Duration::from_secs)
 }
 
 /// Truncate a command string for safe display in channel notifications.
