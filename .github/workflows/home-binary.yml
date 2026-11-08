@@ -1,0 +1,60 @@
+# Home patch: build the patched gateway binary for linux/amd64 and publish it as a release asset.
+name: home-binary
+
+on:
+  push:
+    branches: ["home/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: home-binary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build patched binary
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: binary-export
+          platforms: linux/amd64
+          outputs: type=local,dest=out
+
+      - name: Package
+        id: package
+        run: |
+          upstream_version="${GITHUB_REF_NAME#home/}"
+          release_tag="${upstream_version}-home.${GITHUB_RUN_NUMBER}"
+          mkdir -p dist
+          tar -C out -czf "dist/moltis-${release_tag}-linux-amd64.tar.gz" moltis libzvec_c_api.so
+          (cd dist && sha256sum ./*.tar.gz > SHA256SUMS && cat SHA256SUMS)
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.package.outputs.release_tag }}
+        run: |
+          gh release create "$RELEASE_TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
+            --notes "Upstream ${GITHUB_REF_NAME#home/} plus the home patch (MOLTIS_TELEGRAM_TRUSTED_CHATS). Built from ${GITHUB_SHA}."

@@ -64,6 +64,11 @@ ENV MOLTIS_VERSION=${MOLTIS_VERSION}
 RUN ./scripts/cargo-build-moltis.sh --release
 
 # Runtime stage
+# Home patch: export only the built gateway artifacts (used by the home-binary workflow).
+FROM scratch AS binary-export
+COPY --from=builder /build/target/release/moltis /moltis
+COPY --from=builder /build/target/release/build/zvec-rust-sys-*/out/zvec-prebuilt/libzvec_c_api.so /libzvec_c_api.so
+
 FROM debian:trixie-slim
 
 # Install base runtime dependencies

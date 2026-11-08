@@ -88,7 +88,11 @@ pub(crate) fn is_shared_chat_with_hint(
 ) -> bool {
     match channel_type {
         // Negative ids are groups, supergroups, and channels; users are positive.
-        ChannelType::Telegram => !chat_id.chars().all(|c| c.is_ascii_digit()) || chat_id.is_empty(),
+        // Home patch: chats listed in MOLTIS_TELEGRAM_TRUSTED_CHATS count as direct.
+        ChannelType::Telegram => {
+            !is_trusted_telegram_chat(chat_id)
+                && (!chat_id.chars().all(|c| c.is_ascii_digit()) || chat_id.is_empty())
+        },
         // Signal direct ids are an E.164 number or an ACI UUID; groups carry a
         // `group:` prefix. Both forms are non-empty, so a blank id is unknown.
         ChannelType::Signal => chat_id.is_empty() || chat_id.starts_with("group:"),
@@ -108,6 +112,23 @@ pub(crate) fn is_shared_chat_with_hint(
         // conversation kind and the adapters do not yet forward it.
         ChannelType::Telephony | ChannelType::MsTeams | ChannelType::Matrix => true,
     }
+}
+
+/// Home patch: Telegram chat ids listed (comma-separated) in the
+/// `MOLTIS_TELEGRAM_TRUSTED_CHATS` environment variable are treated as
+/// one-to-one chats, so an operator gets the full private context and
+/// operator-direct commands (e.g. `/approve`) in that group and its forum
+/// topics. Only list groups whose members are all operators: non-operator
+/// senders are still untrusted through the separate sender-role check.
+/// A forum-topic target (`chat_id:thread_id`) matches on its chat id.
+fn is_trusted_telegram_chat(chat_id: &str) -> bool {
+    let base_chat_id = chat_id.split_once(':').map_or(chat_id, |(chat, _)| chat);
+    if base_chat_id.is_empty() {
+        return false;
+    }
+    std::env::var("MOLTIS_TELEGRAM_TRUSTED_CHATS")
+        .map(|list| list.split(',').map(str::trim).any(|id| id == base_chat_id))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
