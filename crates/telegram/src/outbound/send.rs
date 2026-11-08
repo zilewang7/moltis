@@ -5,7 +5,7 @@ use {
     teloxide::{
         payloads::{SendChatActionSetters, SendLocationSetters, SendVenueSetters},
         prelude::*,
-        types::{ChatAction, ChatId, ParseMode},
+        types::{ChatAction, ChatId},
     },
     tracing::info,
 };
@@ -15,6 +15,7 @@ use moltis_channels::{Result, plugin::ChannelOutbound};
 use moltis_common::types::ReplyPayload;
 
 use crate::{
+    body::TgBody,
     markdown::{self, TELEGRAM_MAX_MESSAGE_LEN},
     topic::parse_chat_target,
 };
@@ -35,7 +36,10 @@ impl TelegramOutbound {
         let rp = self.reply_params(account_id, reply_to);
 
         // Send raw HTML chunks without markdown conversion.
-        let chunks = markdown::chunk_message(html, TELEGRAM_MAX_MESSAGE_LEN);
+        let chunks: Vec<TgBody> = markdown::chunk_message(html, TELEGRAM_MAX_MESSAGE_LEN)
+            .into_iter()
+            .map(TgBody::Html)
+            .collect();
         let mut ids = Vec::with_capacity(chunks.len());
         for chunk in &chunks {
             let id = self
@@ -76,7 +80,7 @@ impl TelegramOutbound {
         let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
 
         // Append the pre-formatted suffix (e.g. activity logbook) to the last chunk.
-        let chunks = markdown::chunk_markdown_html(text, TELEGRAM_MAX_MESSAGE_LEN);
+        let chunks = markdown::render_markdown_bodies(text, TELEGRAM_MAX_MESSAGE_LEN, false);
         let last_idx = chunks.len().saturating_sub(1);
         info!(
             account_id,
@@ -92,10 +96,16 @@ impl TelegramOutbound {
         for (i, chunk) in chunks.iter().enumerate() {
             let content = if i == last_idx {
                 // Append suffix to the last chunk. If it would exceed the limit,
-                // the suffix becomes a separate final message.
-                let combined = format!("{chunk}\n\n{suffix_html}");
-                if combined.len() <= TELEGRAM_MAX_MESSAGE_LEN {
-                    combined
+                // the suffix becomes a separate final message. Home patch: model
+                // output rendered as entities never embeds the HTML suffix; it
+                // goes out separately, like the streaming logbook follow-up.
+                let combined = match chunk {
+                    TgBody::Html(html) => Some(format!("{html}\n\n{suffix_html}"))
+                        .filter(|combined| combined.len() <= TELEGRAM_MAX_MESSAGE_LEN),
+                    TgBody::Entities { .. } => None,
+                };
+                if let Some(combined) = combined {
+                    TgBody::Html(combined)
                 } else {
                     // Send this chunk first, then the suffix as a separate message.
                     let id = self
@@ -119,7 +129,7 @@ impl TelegramOutbound {
                             to,
                             chat_id,
                             thread_id,
-                            suffix_html,
+                            &TgBody::from(suffix_html),
                             rp.as_ref(),
                             true,
                         )
@@ -186,7 +196,7 @@ impl ChannelOutbound for TelegramOutbound {
         // Send typing indicator
         let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
 
-        let chunks = markdown::chunk_markdown_html(text, TELEGRAM_MAX_MESSAGE_LEN);
+        let chunks = markdown::render_markdown_bodies(text, TELEGRAM_MAX_MESSAGE_LEN, false);
         info!(
             account_id,
             chat_id = to,
@@ -237,7 +247,7 @@ impl ChannelOutbound for TelegramOutbound {
 
         let _ = bot.send_chat_action(chat_id, ChatAction::Typing).await;
 
-        let chunks = markdown::chunk_markdown_html(text, TELEGRAM_MAX_MESSAGE_LEN);
+        let chunks = markdown::render_markdown_bodies(text, TELEGRAM_MAX_MESSAGE_LEN, false);
         let mut ids = Vec::with_capacity(chunks.len());
         for chunk in chunks.iter() {
             let reply_params = rp.as_ref();
@@ -333,7 +343,7 @@ impl ChannelOutbound for TelegramOutbound {
         let (chat_id, thread_id) = parse_chat_target(to)?;
         let rp = self.reply_params(account_id, reply_to);
 
-        let chunks = markdown::chunk_markdown_html(text, TELEGRAM_MAX_MESSAGE_LEN);
+        let chunks = markdown::render_markdown_bodies(text, TELEGRAM_MAX_MESSAGE_LEN, false);
         info!(
             account_id,
             chat_id = to,
@@ -456,18 +466,20 @@ impl TelegramOutbound {
         if payload.media.is_some() {
             // Use the media path -- but we need account_id, which we don't have here.
             // For direct bot usage, delegate to send_text for now.
-            let chunks = markdown::chunk_markdown_html(&payload.text, TELEGRAM_MAX_MESSAGE_LEN);
+            let chunks =
+                markdown::render_markdown_bodies(&payload.text, TELEGRAM_MAX_MESSAGE_LEN, false);
             for chunk in chunks {
-                bot.send_message(chat_id, &chunk)
-                    .parse_mode(ParseMode::Html)
+                chunk
+                    .send_request(bot, chat_id)
                     .await
                     .channel_context("send reply chunk (media)")?;
             }
         } else if !payload.text.is_empty() {
-            let chunks = markdown::chunk_markdown_html(&payload.text, TELEGRAM_MAX_MESSAGE_LEN);
+            let chunks =
+                markdown::render_markdown_bodies(&payload.text, TELEGRAM_MAX_MESSAGE_LEN, false);
             for chunk in chunks {
-                bot.send_message(chat_id, &chunk)
-                    .parse_mode(ParseMode::Html)
+                chunk
+                    .send_request(bot, chat_id)
                     .await
                     .channel_context("send reply chunk")?;
             }

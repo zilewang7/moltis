@@ -10,16 +10,16 @@ use {
         ApiError, RequestError,
         payloads::SendMessageSetters,
         prelude::*,
-        types::{ChatId, MessageId, ParseMode, ThreadId},
+        types::{ChatId, MessageId, ThreadId},
     },
     tracing::warn,
 };
 
 use moltis_channels::{Error as ChannelError, Result};
 
-use super::{
-    TELEGRAM_RETRY_AFTER_MAX_RETRIES, TelegramOutbound, formatting::telegram_html_to_plain_text,
-};
+use crate::body::TgBody;
+
+use super::{TELEGRAM_RETRY_AFTER_MAX_RETRIES, TelegramOutbound};
 
 pub(crate) trait RequestResultExt<T> {
     fn channel_context(self, context: &'static str) -> Result<T>;
@@ -50,34 +50,34 @@ impl TelegramOutbound {
         to: &str,
         chat_id: ChatId,
         thread_id: Option<ThreadId>,
-        chunk: &str,
+        chunk: &TgBody,
         reply_params: Option<&teloxide::types::ReplyParameters>,
         silent: bool,
     ) -> Result<MessageId> {
         match self
-            .run_telegram_request_with_retry(account_id, to, "send message (html)", || {
-                let mut html_req = bot.send_message(chat_id, chunk).parse_mode(ParseMode::Html);
+            .run_telegram_request_with_retry(account_id, to, "send message (formatted)", || {
+                let mut formatted_req = chunk.send_request(bot, chat_id);
                 if silent {
-                    html_req = html_req.disable_notification(true);
+                    formatted_req = formatted_req.disable_notification(true);
                 }
                 if let Some(tid) = thread_id {
-                    html_req = html_req.message_thread_id(tid);
+                    formatted_req = formatted_req.message_thread_id(tid);
                 }
                 if let Some(rp) = reply_params {
-                    html_req = html_req.reply_parameters(rp.clone());
+                    formatted_req = formatted_req.reply_parameters(rp.clone());
                 }
-                async move { html_req.await }
+                async move { formatted_req.await }
             })
             .await
         {
             Ok(message) => Ok(message.id),
             Err(e) => {
-                let plain_chunk = telegram_html_to_plain_text(chunk);
+                let plain_chunk = chunk.plain_text();
                 warn!(
                     account_id,
                     chat_id = to,
                     error = %e,
-                    "telegram HTML send failed, retrying as plain text"
+                    "telegram formatted send failed, retrying as plain text"
                 );
                 let message = self
                     .run_telegram_request_with_retry(account_id, to, "send message (plain)", || {

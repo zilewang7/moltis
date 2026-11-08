@@ -378,7 +378,7 @@ fn stream_min_initial_chars_uses_character_count() {
 
 #[test]
 fn stream_progress_html_omits_progress_heading() {
-    let html = format_stream_progress_html("working", false);
+    let html = format_stream_progress_html("working", false).as_str().to_owned();
 
     assert!(!html.contains("Progress update"));
     assert!(html.contains("working"));
@@ -391,7 +391,7 @@ fn stream_progress_state_flushes_pending_text_after_throttle() {
 
     state.push_delta("hel");
     assert!(state.should_send_initial_progress());
-    state.mark_progress_sent(now, "initial");
+    state.mark_progress_sent(now, &"initial".into());
     state.push_delta("lo");
 
     assert!(!state.should_flush_progress(now, Duration::from_secs(2)));
@@ -404,7 +404,7 @@ fn stream_progress_state_suppresses_flush_until_backoff_expires() {
     let now = Instant::now();
 
     state.push_delta("hel");
-    state.mark_progress_sent(now, "initial");
+    state.mark_progress_sent(now, &"initial".into());
     state.push_delta("lo");
     assert!(state.should_flush_progress(now + Duration::from_secs(2), Duration::from_secs(2)));
 
@@ -420,11 +420,11 @@ fn stream_progress_state_resets_throttle_when_rendered_html_is_unchanged() {
     let now = Instant::now();
 
     state.push_delta("hel");
-    state.mark_progress_sent(now, "same");
+    state.mark_progress_sent(now, &"same".into());
     state.push_delta("lo");
     assert!(state.should_flush_progress(now + Duration::from_secs(2), Duration::from_secs(2)));
 
-    state.mark_progress_observed(now + Duration::from_secs(2), "same");
+    state.mark_progress_observed(now + Duration::from_secs(2), &"same".into());
 
     assert!(!state.should_flush_progress(now + Duration::from_secs(3), Duration::from_secs(2)));
     assert!(!state.should_flush_progress(now + Duration::from_secs(4), Duration::from_secs(2)));
@@ -436,7 +436,7 @@ fn stream_progress_state_keeps_recent_tail_when_progress_exceeds_limit() {
 
     state.push_delta("old-prefix ");
     state.push_delta("fresh-tail");
-    let html = state.current_progress_html();
+    let html = state.current_progress_html().as_str().to_owned();
 
     assert!(html.contains("Older progress hidden"));
     assert!(html.contains("fresh-tail"));
@@ -448,7 +448,7 @@ fn stream_progress_tail_escapes_html_and_stays_under_telegram_limit() {
     let mut state = StreamProgressState::new(1, TELEGRAM_MAX_MESSAGE_LEN);
 
     state.push_delta(&"<".repeat(TELEGRAM_MAX_MESSAGE_LEN));
-    let html = state.current_progress_html();
+    let html = state.current_progress_html().as_str().to_owned();
 
     assert!(html.contains("&lt;"));
     assert!(!html.contains("<".repeat(10).as_str()));

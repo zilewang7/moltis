@@ -1,3 +1,5 @@
+use crate::body::TgBody;
+
 /// Convert a subset of Markdown to Telegram-compatible HTML.
 ///
 /// Telegram supports: `<b>`, `<i>`, `<code>`, `<pre>`, `<a href="">`,
@@ -523,6 +525,27 @@ pub fn chunk_message(text: &str, max_len: usize) -> Vec<String> {
     }
 
     chunks
+}
+
+/// Render markdown into Telegram message bodies that each fit `max_len`.
+///
+/// Home patch: uses the external renderer (plain text + entities, see
+/// `md_renderer`) when configured, otherwise the built-in HTML converter.
+/// `streaming` marks a growing prefix of a streamed reply, so unclosed
+/// constructs render as their intended formatting.
+pub fn render_markdown_bodies(markdown: &str, max_len: usize, streaming: bool) -> Vec<TgBody> {
+    if max_len == 0 || markdown.is_empty() {
+        return Vec::new();
+    }
+    if let Some(bodies) = crate::md_renderer::render_chunks(markdown, max_len, streaming)
+        && !bodies.is_empty()
+    {
+        return bodies;
+    }
+    chunk_markdown_html(markdown, max_len)
+        .into_iter()
+        .map(TgBody::Html)
+        .collect()
 }
 
 /// Split markdown into Telegram-safe HTML chunks that each fit `max_len`.

@@ -4,11 +4,13 @@
 //! messages via the Telegram Bot API, including edit-in-place streaming.
 
 pub mod access;
+pub mod body;
 pub mod bot;
 pub mod config;
 pub mod error;
 pub mod handlers;
 pub mod markdown;
+mod md_renderer;
 pub mod otp;
 pub mod outbound;
 pub mod plugin;

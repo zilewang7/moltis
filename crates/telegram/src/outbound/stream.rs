@@ -5,7 +5,7 @@ use {
     std::time::Duration,
     teloxide::{
         prelude::*,
-        types::{ChatAction, ChatId, MessageId, ParseMode, ReplyParameters, ThreadId},
+        types::{ChatAction, ChatId, MessageId, ReplyParameters, ThreadId},
     },
     tracing::{debug, warn},
 };
@@ -16,6 +16,7 @@ use moltis_channels::{
 };
 
 use crate::{
+    body::TgBody,
     config::StreamMode,
     markdown::{self, TELEGRAM_MAX_MESSAGE_LEN},
     topic::parse_chat_target,
@@ -32,25 +33,36 @@ pub(super) fn has_reached_stream_min_initial_chars(
     seen_chars >= min_initial_chars
 }
 
-pub(super) fn format_stream_progress_html(progress: &str, older_progress_hidden: bool) -> String {
-    fn build(progress: &str, older_progress_hidden: bool) -> (String, bool) {
-        let marker = if older_progress_hidden {
-            "<i>Older progress hidden.</i>\n\n"
+const OLDER_PROGRESS_HIDDEN: &str = "Older progress hidden.";
+
+pub(super) fn format_stream_progress_html(progress: &str, older_progress_hidden: bool) -> TgBody {
+    fn with_marker(body: TgBody, older_progress_hidden: bool) -> TgBody {
+        if older_progress_hidden {
+            body.with_italic_prefix(OLDER_PROGRESS_HIDDEN)
         } else {
-            ""
+            body
+        }
+    }
+
+    fn build(progress: &str, older_progress_hidden: bool) -> (TgBody, bool) {
+        // Budget for "<i>…</i>\n\n", the HTML form of the marker (the larger one).
+        let prefix_len = if older_progress_hidden {
+            OLDER_PROGRESS_HIDDEN.len() + "<i></i>\n\n".len()
+        } else {
+            0
         };
-        let prefix = marker.to_string();
-        let available = TELEGRAM_MAX_MESSAGE_LEN.saturating_sub(prefix.len());
-        let chunks = markdown::chunk_markdown_html(progress, available);
+        let available = TELEGRAM_MAX_MESSAGE_LEN.saturating_sub(prefix_len);
+        let chunks = markdown::render_markdown_bodies(progress, available, true);
         if chunks.len() <= 1 {
-            return (
-                format!("{prefix}{}", chunks.into_iter().next().unwrap_or_default()),
-                false,
-            );
+            let body = chunks.into_iter().next().unwrap_or_default();
+            return (with_marker(body, older_progress_hidden), false);
         }
 
         let (tail, truncated_by_limit) = escaped_recent_tail(progress, available);
-        (format!("{prefix}{tail}"), truncated_by_limit)
+        (
+            with_marker(TgBody::Html(tail), older_progress_hidden),
+            truncated_by_limit,
+        )
     }
 
     let (html, truncated_by_limit) = build(progress, older_progress_hidden);
@@ -69,7 +81,7 @@ pub(super) struct StreamProgressState {
     accumulated: String,
     seen_chars: usize,
     last_progress_at: Option<tokio::time::Instant>,
-    last_rendered_html: Option<String>,
+    last_rendered_html: Option<TgBody>,
     defer_until: Option<tokio::time::Instant>,
     min_initial_chars: usize,
     max_chars: usize,
@@ -138,13 +150,13 @@ impl StreamProgressState {
         self.dirty && now.saturating_duration_since(last_progress_at) >= throttle
     }
 
-    pub(super) fn current_progress_html(&self) -> String {
+    pub(super) fn current_progress_html(&self) -> TgBody {
         format_stream_progress_html(&self.accumulated, self.older_progress_hidden)
     }
 
-    pub(super) fn mark_progress_sent(&mut self, now: tokio::time::Instant, rendered_html: &str) {
+    pub(super) fn mark_progress_sent(&mut self, now: tokio::time::Instant, rendered_html: &TgBody) {
         self.last_progress_at = Some(now);
-        self.last_rendered_html = Some(rendered_html.to_string());
+        self.last_rendered_html = Some(rendered_html.clone());
         self.defer_until = None;
         self.dirty = false;
     }
@@ -152,7 +164,7 @@ impl StreamProgressState {
     pub(super) fn mark_progress_observed(
         &mut self,
         now: tokio::time::Instant,
-        rendered_html: &str,
+        rendered_html: &TgBody,
     ) {
         self.mark_progress_sent(now, rendered_html);
     }
@@ -164,8 +176,8 @@ impl StreamProgressState {
         };
     }
 
-    fn rendered_html_changed(&self, rendered_html: &str) -> bool {
-        match self.last_rendered_html.as_deref() {
+    fn rendered_html_changed(&self, rendered_html: &TgBody) -> bool {
+        match self.last_rendered_html.as_ref() {
             Some(last) => last != rendered_html,
             None => true,
         }
@@ -176,7 +188,7 @@ struct StreamFinalState {
     accumulated: String,
     seen_chars: usize,
     last_progress_at: Option<tokio::time::Instant>,
-    last_rendered_html: Option<String>,
+    last_rendered_html: Option<TgBody>,
     defer_until: Option<tokio::time::Instant>,
     min_initial_chars: usize,
     dirty: bool,
@@ -220,18 +232,18 @@ impl StreamFinalState {
         self.dirty && now.saturating_duration_since(last_progress_at) >= throttle
     }
 
-    fn current_final_html(&self) -> String {
+    fn current_final_html(&self) -> TgBody {
         render_stream_final_html(&self.accumulated)
     }
 
-    fn mark_final_sent(&mut self, now: tokio::time::Instant, rendered_html: &str) {
+    fn mark_final_sent(&mut self, now: tokio::time::Instant, rendered_html: &TgBody) {
         self.last_progress_at = Some(now);
-        self.last_rendered_html = Some(rendered_html.to_string());
+        self.last_rendered_html = Some(rendered_html.clone());
         self.defer_until = None;
         self.dirty = false;
     }
 
-    fn mark_final_observed(&mut self, now: tokio::time::Instant, rendered_html: &str) {
+    fn mark_final_observed(&mut self, now: tokio::time::Instant, rendered_html: &TgBody) {
         self.mark_final_sent(now, rendered_html);
     }
 
@@ -242,8 +254,8 @@ impl StreamFinalState {
         };
     }
 
-    fn rendered_html_changed(&self, rendered_html: &str) -> bool {
-        match self.last_rendered_html.as_deref() {
+    fn rendered_html_changed(&self, rendered_html: &TgBody) -> bool {
+        match self.last_rendered_html.as_ref() {
             Some(last) => last != rendered_html,
             None => true,
         }
@@ -255,8 +267,8 @@ impl StreamFinalState {
     }
 }
 
-fn render_stream_final_html(text: &str) -> String {
-    markdown::chunk_markdown_html(text, TELEGRAM_MAX_MESSAGE_LEN)
+fn render_stream_final_html(text: &str) -> TgBody {
+    markdown::render_markdown_bodies(text, TELEGRAM_MAX_MESSAGE_LEN, true)
         .into_iter()
         .next()
         .unwrap_or_default()
@@ -270,13 +282,9 @@ impl TelegramOutbound {
         to: &str,
         chat_id: ChatId,
         message_id: MessageId,
-        chunk: &str,
+        chunk: &TgBody,
     ) -> ProgressEditResult {
-        match bot
-            .edit_message_text(chat_id, message_id, chunk)
-            .parse_mode(ParseMode::Html)
-            .await
-        {
+        match chunk.edit_request(bot, chat_id, message_id).await {
             Ok(_) => ProgressEditResult::Applied,
             Err(error) if super::retry::is_message_not_modified_error(&error) => {
                 ProgressEditResult::Applied
@@ -339,7 +347,7 @@ impl TelegramOutbound {
                 to,
                 chat_id,
                 message_id,
-                stream_progress_cleanup_html(),
+                &TgBody::from(stream_progress_cleanup_html()),
             )
             .await
         {
@@ -406,7 +414,7 @@ impl TelegramOutbound {
         stream_cfg: StreamSendConfig,
         progress_message_id: &mut Option<MessageId>,
         final_state: &mut StreamFinalState,
-        rendered_html: &str,
+        rendered_html: &TgBody,
         now: tokio::time::Instant,
         throttle: Duration,
         final_delivery: bool,
@@ -523,8 +531,11 @@ impl TelegramOutbound {
         reply_params: Option<&ReplyParameters>,
         final_state: &StreamFinalState,
     ) -> Result<Vec<String>> {
-        let chunks =
-            markdown::chunk_markdown_html(&final_state.accumulated, TELEGRAM_MAX_MESSAGE_LEN);
+        let chunks = markdown::render_markdown_bodies(
+            &final_state.accumulated,
+            TELEGRAM_MAX_MESSAGE_LEN,
+            false,
+        );
         let mut ids = Vec::new();
         for chunk in chunks.into_iter().skip(1) {
             let id = self
@@ -597,7 +608,7 @@ impl TelegramOutbound {
 fn record_progress_edit_result(
     progress: &mut StreamProgressState,
     now: tokio::time::Instant,
-    rendered_html: &str,
+    rendered_html: &TgBody,
     throttle: Duration,
     result: ProgressEditResult,
 ) {
@@ -613,7 +624,7 @@ fn record_progress_edit_result(
 fn record_final_edit_result(
     final_state: &mut StreamFinalState,
     now: tokio::time::Instant,
-    rendered_html: &str,
+    rendered_html: &TgBody,
     throttle: Duration,
     result: ProgressEditResult,
 ) {

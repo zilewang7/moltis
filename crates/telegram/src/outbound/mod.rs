@@ -15,6 +15,8 @@ mod stream;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use formatting::telegram_html_to_plain_text;
+
 use std::time::Duration;
 
 use {
