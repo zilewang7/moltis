@@ -471,6 +471,40 @@ pub(super) fn check_bot_mentioned(msg: &Message, bot_username: Option<&str>) -> 
     }
 }
 
+/// Telegram clients append the bot username to commands picked from the menu
+/// in groups (`/new@my_bot args`). Strip our own username so the command
+/// dispatches like `/new args`. Returns `None` when the command is addressed
+/// to a different bot, which Telegram expects us to ignore. Only
+/// `/<word>@<word>` heads count as commands, so paths like `/home/u@host`
+/// pass through untouched.
+pub(super) fn normalize_bot_command(body: String, bot_username: Option<&str>) -> Option<String> {
+    fn is_word(part: &str) -> bool {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    }
+
+    let Some(rest) = body.strip_prefix('/') else {
+        return Some(body);
+    };
+    let head_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let (head, tail) = rest.split_at(head_end);
+    let Some((command, target)) = head.split_once('@') else {
+        return Some(body);
+    };
+    if !is_word(command) || !is_word(target) {
+        return Some(body);
+    }
+    match bot_username {
+        Some(username) if target.eq_ignore_ascii_case(username) => {
+            Some(format!("/{command}{tail}"))
+        },
+        Some(_) => None,
+        None => Some(body),
+    }
+}
+
 #[allow(dead_code)]
 pub(super) fn build_session_key(
     account_id: &str,

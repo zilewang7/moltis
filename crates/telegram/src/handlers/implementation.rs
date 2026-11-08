@@ -531,6 +531,15 @@ pub async fn handle_message_direct(
         (text.unwrap_or_default(), Vec::new(), None, None)
     };
 
+    let Some(body) = normalize_bot_command(body, bot_username.as_deref()) else {
+        debug!(
+            account_id,
+            chat_id = msg.chat.id.0,
+            "ignoring command addressed to another bot"
+        );
+        return Ok(());
+    };
+
     // Dispatch to the chat session (per-channel session key derived by the sink).
     // The reply target tells the gateway where to send the LLM response back.
     let has_content = !body.is_empty() || !attachments.is_empty();

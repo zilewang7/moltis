@@ -57,3 +57,47 @@ fn security_otp_challenge_message_does_not_contain_code() {
         "OTP challenge message must tell the user where to find the code"
     );
 }
+
+#[test]
+fn bot_command_suffix_for_this_bot_is_stripped() {
+    let bot = Some("Heimaos_Hermes_Bot");
+    assert_eq!(
+        normalize_bot_command("/new@heimaos_hermes_bot".into(), bot).as_deref(),
+        Some("/new")
+    );
+    assert_eq!(
+        normalize_bot_command("/model@heimaos_hermes_bot  gpt x".into(), bot).as_deref(),
+        Some("/model  gpt x")
+    );
+}
+
+#[test]
+fn bot_command_for_other_bot_is_ignored() {
+    assert_eq!(
+        normalize_bot_command("/new@other_bot".into(), Some("heimaos_hermes_bot")),
+        None
+    );
+}
+
+#[test]
+fn non_command_text_passes_through() {
+    let bot = Some("heimaos_hermes_bot");
+    for body in [
+        "/new",
+        "/new args",
+        "hello @other_bot",
+        "/home/u@host ls",
+        "/new@",
+        "/@heimaos_hermes_bot",
+        "",
+    ] {
+        assert_eq!(
+            normalize_bot_command(body.into(), bot).as_deref(),
+            Some(body)
+        );
+    }
+    assert_eq!(
+        normalize_bot_command("/new@any_bot".into(), None).as_deref(),
+        Some("/new@any_bot")
+    );
+}
