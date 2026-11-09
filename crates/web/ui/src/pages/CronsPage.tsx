@@ -537,7 +537,8 @@ function HeartbeatSection(): VNode {
 				<p className="text-xs text-[var(--muted)] mb-3">Run heartbeat commands in an isolated container.</p>
 				<div className="flex items-center gap-3 mb-3">
 					<label className="cron-toggle">
-						<input data-hb="sandboxEnabled" type="checkbox" checked={cfg.sandbox_enabled !== false} />
+						{/* Home patch: unset means off (no container runtime in the add-on) */}
+						<input data-hb="sandboxEnabled" type="checkbox" checked={cfg.sandbox_enabled ?? false} />
 						<span className="cron-slider" />
 					</label>
 					<span className="text-sm text-[var(--text)]">Enable sandbox</span>

@@ -989,11 +989,24 @@ pub async fn api_available_backends_handler() -> impl IntoResponse {
 
     // Local container backends.
     if moltis_tools::sandbox::is_cli_available("docker") {
+        // Home patch: a docker CLI on PATH does not mean the daemon answers. The
+        // router already falls back to restricted-host when it cannot reach the
+        // daemon, so report the backend honestly here as well — otherwise the UI
+        // offers a "sandbox" that only strips env vars and sets rlimits.
+        let daemon_ok = moltis_tools::sandbox::is_docker_daemon_available();
         backends.push(serde_json::json!({
             "id": "docker",
             "label": "Docker",
             "kind": "local",
-            "available": true,
+            "available": daemon_ok,
+            "installHint": if daemon_ok {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(
+                    "The docker CLI is installed but the daemon is not reachable \
+                     (check the socket mount or start dockerd)."
+                )
+            },
         }));
     }
     if moltis_tools::sandbox::is_cli_available("podman") {

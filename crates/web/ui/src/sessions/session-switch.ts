@@ -117,11 +117,11 @@ export function restoreSessionState(entry: SessionMeta, projectId?: string): voi
 			S.modelComboLabel.title = found ? modelTitle(found) : label;
 		}
 	}
-	updateSandboxUI(entry.sandbox_enabled !== false);
+	updateSandboxUI(S.resolveSandboxEnabled(entry.sandbox_enabled));
 	updateSandboxImageUI(entry.sandbox_image || null);
 	S.setSessionSandboxBackend(entry.sandbox_backend || null);
 	const sandboxRuntimeAvailable = ((S.sandboxInfo as SandboxInfoPayload | null)?.backend || "none") !== "none";
-	const effectiveSandboxRoute = entry.sandbox_enabled !== false && sandboxRuntimeAvailable;
+	const effectiveSandboxRoute = S.resolveSandboxEnabled(entry.sandbox_enabled) && sandboxRuntimeAvailable;
 	S.setSessionExecMode(effectiveSandboxRoute ? "sandbox" : "host");
 	S.setSessionExecPromptSymbol(effectiveSandboxRoute || S.hostExecIsRoot ? "#" : "$");
 	updateCommandInputUI();

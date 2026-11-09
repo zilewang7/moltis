@@ -754,7 +754,7 @@ function initializeChatControls(): void {
 	S.setSandboxToggleBtn(S.$("sandboxToggle"));
 	S.setSandboxLabel(S.$("sandboxLabel"));
 	bindSandboxToggleEvents();
-	updateSandboxUI(true);
+	updateSandboxUI(S.SANDBOX_DEFAULT_ENABLED);
 	S.setSandboxImageBtn(S.$("sandboxImageBtn"));
 	S.setSandboxImageLabel(S.$("sandboxImageLabel"));
 	S.setSandboxImageDropdown(S.$("sandboxImageDropdown"));

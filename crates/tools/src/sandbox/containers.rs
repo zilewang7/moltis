@@ -1051,7 +1051,7 @@ pub(crate) fn should_use_docker_backend(
     docker_cli_available && docker_daemon_available
 }
 
-pub(crate) fn is_docker_daemon_available() -> bool {
+pub fn is_docker_daemon_available() -> bool {
     std::process::Command::new("docker")
         .args(["info", "--format", "{{.ServerVersion}}"])
         .stdout(std::process::Stdio::null())

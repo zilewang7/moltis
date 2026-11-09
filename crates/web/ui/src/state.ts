@@ -61,7 +61,22 @@ export let projectDropdownList: HTMLElement | null = null;
 // Sandbox toggle
 export let sandboxToggleBtn: HTMLButtonElement | null = null;
 export let sandboxLabel: HTMLElement | null = null;
-export let sessionSandboxEnabled = true;
+/**
+ * Home patch: sandbox state for a session whose stored `sandbox_enabled` is
+ * unset (NULL). Upstream assumes true; this build assumes false because the HA
+ * add-on runs without a container runtime (the docker CLI is present but the
+ * daemon is unreachable), so "sandbox on" would only mean restricted-host —
+ * env cleared and resource limits, no isolation. Toggle it per session if you
+ * really want that.
+ */
+export const SANDBOX_DEFAULT_ENABLED = false;
+
+/** Resolve a session's stored sandbox flag against the build default. */
+export function resolveSandboxEnabled(value: boolean | null | undefined): boolean {
+	return value ?? SANDBOX_DEFAULT_ENABLED;
+}
+
+export let sessionSandboxEnabled = SANDBOX_DEFAULT_ENABLED;
 export let sessionSandboxImage: string | null = null;
 export let sessionSandboxBackend: string | null = null;
 export let sandboxImageBtn: HTMLButtonElement | null = null;
