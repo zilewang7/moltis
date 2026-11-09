@@ -412,20 +412,68 @@ fn start_channel_typing_loop(
     // topic needs `chat_id:thread_id` or the chat action lands in the group's
     // General topic instead of the thread the user is actually reading.
     let chat_id = reply_to.outbound_to().into_owned();
+    let target = reply_to.clone();
+    let loop_state = Arc::clone(state);
 
     tokio::spawn(async move {
+        // `chat.send` returns as soon as the run is admitted, so the loop must
+        // not stop there: a turn that spends a minute in tool calls would flash
+        // the indicator for two seconds and then look dead. Keep refreshing for
+        // as long as the session has a live run.
+        let session_key = match loop_state.services.session_metadata.as_ref() {
+            Some(metadata) => resolve_channel_session(&target, metadata).await,
+            None => default_channel_session_key(&target),
+        };
+        let started = std::time::Instant::now();
+        let mut admitted = false;
+        let mut idle_checks = 0u8;
         loop {
             if let Err(e) = outbound.send_typing(&account_id, &chat_id).await {
                 debug!(account_id, chat_id, "typing indicator failed: {e}");
             }
+            match done_rx.try_recv() {
+                Ok(()) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => admitted = true,
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {},
+            }
+            if admitted {
+                // Two consecutive quiet checks, so the gap between "run
+                // admitted" and "run registered" cannot end the indicator.
+                if session_has_live_run(&loop_state, &session_key).await {
+                    idle_checks = 0;
+                } else {
+                    idle_checks += 1;
+                    if idle_checks >= 2 {
+                        break;
+                    }
+                }
+            }
+            // Hard ceiling: never leave a typing indicator running forever if a
+            // run dies without clearing its registration.
+            if started.elapsed() > std::time::Duration::from_secs(1900) {
+                break;
+            }
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(4)) => {},
-                _ = &mut done_rx => break,
+                _ = &mut done_rx, if !admitted => { admitted = true; },
             }
         }
     });
 
     Some(done_tx)
+}
+
+/// Whether the session currently has a run in flight.
+///
+/// Errors and missing fields read as "no run": the typing loop then stops
+/// rather than spinning on a session it cannot see.
+async fn session_has_live_run(state: &Arc<GatewayState>, session_key: &str) -> bool {
+    state
+        .chat()
+        .peek(serde_json::json!({ "sessionKey": session_key }))
+        .await
+        .ok()
+        .and_then(|value| value.get("active").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
 }
 
 /// Create and register a per-turn acknowledgment reaction controller, keyed by
