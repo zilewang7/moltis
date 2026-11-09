@@ -1139,9 +1139,17 @@ pub async fn run_agent_loop_streaming_with_limits(
             on_event,
         );
 
-        // Drain any pending steering text and inject as a system note.
-        // Uses system role to avoid consecutive-user-message violations
-        // with strict providers that enforce role alternation.
+        // Drain any pending steering text and deliver it to the model.
+        //
+        // Delivered as a *user* message, not a system note. A late system
+        // message sits below the conversation as background and is easy for the
+        // model to read past while it finishes its own plan — observed on
+        // 2026-11-10: the note reached the request but the reply answered the
+        // previous question instead. Steering is literally the user talking, so
+        // it is sent with the user role and says what it is.
+        //
+        // Role alternation is safe here: this runs straight after tool results,
+        // so the preceding message is never a user message.
         if let Some(ref inbox) = steer_inbox {
             let mut guard = inbox.lock().await;
             if !guard.is_empty() {
@@ -1150,8 +1158,9 @@ pub async fn run_agent_loop_streaming_with_limits(
                     steer_bytes = combined.len(),
                     "injected steering guidance into the next request"
                 );
-                messages.push(ChatMessage::system(format!(
-                    "[Steering note from the user — adjust your approach accordingly]: {combined}"
+                messages.push(ChatMessage::user(format!(
+                    "[插话 / steering — 用户在你执行任务期间发来了这条消息。先用一两句话正面回应它，\
+再继续原来的工作；如果它改变了任务方向，就按它执行。]\n{combined}"
                 )));
             }
         }
