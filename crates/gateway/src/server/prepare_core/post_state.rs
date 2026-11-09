@@ -326,7 +326,7 @@ pub(super) async fn complete_startup(
                     _ => "denied",
                 };
                 tokio::spawn(async move {
-                    crate::broadcast::broadcast(
+                    broadcast(
                         &state,
                         "exec.approval.resolved",
                         serde_json::json!({
@@ -335,7 +335,7 @@ pub(super) async fn complete_startup(
                             "sessionKey": view.session_key,
                             "decision": decision,
                         }),
-                        crate::broadcast::BroadcastOpts::default(),
+                        BroadcastOpts::default(),
                     )
                     .await;
                 });
