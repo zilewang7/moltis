@@ -11,7 +11,7 @@ use {
     serde_json::Value,
     tokio::{
         sync::{Mutex, RwLock},
-        task::{JoinHandle, JoinSet},
+        task::JoinSet,
     },
     tracing::{info, warn},
 };
@@ -70,17 +70,23 @@ use channel_tasks::channel_task_update;
 #[cfg(feature = "push-notifications")]
 use crate::channel_push::send_chat_push_notification;
 
-struct AbortTask(JoinHandle<()>);
-
-impl AbortTask {
-    fn new(task: JoinHandle<()>) -> Self {
-        Self(task)
-    }
+/// Unregisters a run's steering inbox when the run ends.
+///
+/// Drop cannot await, so the removal is handed to a task. A run that ends must
+/// stop absorbing steering text immediately: the next message belongs to the
+/// next turn, and leaving the inbox registered would swallow it silently.
+struct SteerRegistration {
+    state: Arc<dyn ChatRuntime>,
+    session_key: String,
 }
 
-impl Drop for AbortTask {
+impl Drop for SteerRegistration {
     fn drop(&mut self) {
-        self.0.abort();
+        let state = Arc::clone(&self.state);
+        let session_key = std::mem::take(&mut self.session_key);
+        tokio::spawn(async move {
+            state.unregister_steer_inbox(&session_key).await;
+        });
     }
 }
 
@@ -1009,22 +1015,25 @@ pub(crate) async fn run_with_tools(
         }
     }
 
-    // Create a shared steer inbox that the gateway can push steering text into.
-    // A background task polls the ChatRuntime and forwards any `/steer` text.
+    // Steering inbox for this run.
+    //
+    // The gateway pushes straight into this inbox while the run is active
+    // (`ChatRuntime::push_steer_text`), so delivery does not depend on a
+    // background poller noticing a shared buffer — the previous 500 ms poll
+    // could miss the text entirely and still report the message as steered.
+    //
+    // `SteerRegistration` unregisters on drop, including on early returns, so
+    // a finished run can never keep swallowing a later message.
     let steer_inbox: moltis_agents::runner::SteerInbox = Arc::new(Mutex::new(Vec::new()));
-    let steer_inbox_writer = steer_inbox.clone();
-    let steer_state = state.clone();
-    let steer_session_key = session_key.to_string();
-    let steer_task = AbortTask::new(tokio::spawn(async move {
-        // Drain any stale steering text left over from a previous run.
-        let _ = steer_state.take_steer_text(&steer_session_key).await;
-        loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if let Some(texts) = steer_state.take_steer_text(&steer_session_key).await {
-                steer_inbox_writer.lock().await.extend(texts);
-            }
-        }
-    }));
+    // Clear any text buffered while no run was registered; it is stale.
+    let _ = state.take_steer_text(session_key).await;
+    state
+        .register_steer_inbox(session_key, steer_inbox.clone())
+        .await;
+    let _steer_registration = SteerRegistration {
+        state: Arc::clone(state),
+        session_key: session_key.to_string(),
+    };
 
     let provider_ref = provider.clone();
     let first_agent_future = run_agent_loop_streaming_with_limits(
@@ -1181,7 +1190,9 @@ pub(crate) async fn run_with_tools(
         },
         other => other,
     };
-    drop(steer_task);
+    // Stop accepting steering before the run reports completion: anything that
+    // arrives from here on must queue as its own turn.
+    drop(_steer_registration);
 
     // Ensure all runner events (including deltas) are broadcast in order before
     // emitting terminal final/error frames.

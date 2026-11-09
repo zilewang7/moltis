@@ -198,6 +198,7 @@ impl LiveChatService {
             && !ephemeral
             && message_queue_mode == MessageQueueMode::Steer
             && params.get("content").is_none()
+            && self.state.supports_steering()
             && self.session_has_active_turn(&session_key).await
         {
             let active_run_id = self
@@ -206,18 +207,32 @@ impl LiveChatService {
                 .await
                 .get(&session_key)
                 .cloned();
-            let steer_message = PersistedMessage::User {
-                content: MessageContent::Text(text.clone()),
-                created_at: Some(now_ms()),
-                audio: None,
-                documents: None,
-                channel: params.get("channel").cloned(),
-                seq: client_seq,
-                run_id: active_run_id,
-            };
-            return self
-                .steer_active_turn(&session_key, steer_message, &text)
-                .await;
+            // Deliver first, persist second: if the run has no inbox registered
+            // (it is ending, or this runtime cannot steer) the message must
+            // fall through to ordinary queueing instead of being recorded as
+            // delivered and then dropped.
+            if self
+                .state
+                .push_steer_text(&session_key, text.clone())
+                .await
+            {
+                let steer_message = PersistedMessage::User {
+                    content: MessageContent::Text(text.clone()),
+                    created_at: Some(now_ms()),
+                    audio: None,
+                    documents: None,
+                    channel: params.get("channel").cloned(),
+                    seq: client_seq,
+                    run_id: active_run_id,
+                };
+                return self
+                    .steer_active_turn(&session_key, steer_message, &text)
+                    .await;
+            }
+            debug!(
+                session = %session_key,
+                "chat.send: no live run inbox registered; queueing instead of steering"
+            );
         }
 
         let admission = if queue_if_busy && explicit_shell_command.is_none() {
@@ -1518,12 +1533,11 @@ impl LiveChatService {
         Ok(serde_json::json!({ "ok": true, "runId": run_id }))
     }
 
-    /// Deliver a message into the session's active run as steering guidance.
+    /// Record a message that was already delivered into the session's live run.
     ///
-    /// Two things must happen together, and the order matters: persist first so
-    /// the transcript (and the approval judge reading `chat.history`) has the
-    /// instruction even if the run ends before it drains the inbox, then push the
-    /// text so the runner picks it up after its current tool batch.
+    /// The text itself is pushed by the caller (`ChatRuntime::push_steer_text`)
+    /// before this runs, so the run cannot drain the inbox and finish before the
+    /// transcript has the instruction the approval judge reads as evidence.
     async fn steer_active_turn(
         &self,
         session_key: &str,
@@ -1542,10 +1556,6 @@ impl LiveChatService {
             );
         }
         let _ = self.session_metadata.upsert(session_key, None).await;
-
-        self.state
-            .push_steer_text(session_key, text.to_string())
-            .await;
 
         broadcast(
             &self.state,

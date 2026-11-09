@@ -5,7 +5,10 @@ use {
     teloxide::{
         payloads::{SendChatActionSetters, SendLocationSetters, SendVenueSetters},
         prelude::*,
-        types::{ChatAction, ChatId},
+        types::{
+            ChatAction, ChatFullInfo, ChatFullInfoKind, ChatFullInfoPublicKind, ChatId, MessageId,
+            ThreadId,
+        },
     },
     tracing::info,
 };
@@ -21,6 +24,65 @@ use crate::{
 };
 
 use super::{TelegramOutbound, retry::RequestResultExt};
+
+/// Telegram's fixed topic id for a forum's General topic.
+const GENERAL_TOPIC_ID: i32 = 1;
+
+/// Whether `chat_id` is a forum supergroup, cached per chat.
+///
+/// Only consulted when an address carries no thread id, and only to decide
+/// whether a chat action needs the General topic id. A failure to resolve the
+/// chat is cached as "not a forum" and degrades to the previous behaviour
+/// rather than turning every typing tick into an API error.
+async fn chat_is_forum(bot: &Bot, chat_id: ChatId) -> bool {
+    if let Some(cached) = forum_cache_get(chat_id.0) {
+        return cached;
+    }
+    let is_forum = match bot.get_chat(chat_id).await {
+        Ok(info) => full_info_is_forum(&info),
+        Err(e) => {
+            info!(chat_id = chat_id.0, error = %e, "getChat failed while resolving forum topic");
+            false
+        },
+    };
+    forum_cache_put(chat_id.0, is_forum);
+    is_forum
+}
+
+/// Read `is_forum` out of `getChat`.
+///
+/// `getChat` answers with `ChatFullInfo`, whose group/supergroup details sit
+/// two flattened enums deep; only the supergroup variant carries the flag.
+fn full_info_is_forum(info: &ChatFullInfo) -> bool {
+    match &info.kind {
+        ChatFullInfoKind::Public(public) => match &public.kind {
+            ChatFullInfoPublicKind::Supergroup(supergroup) => supergroup.is_forum,
+            _ => false,
+        },
+        ChatFullInfoKind::Private(_) => false,
+    }
+}
+
+fn forum_cache() -> &'static std::sync::Mutex<std::collections::HashMap<i64, bool>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i64, bool>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn forum_cache_get(chat_id: i64) -> Option<bool> {
+    forum_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&chat_id)
+        .copied()
+}
+
+fn forum_cache_put(chat_id: i64, is_forum: bool) {
+    forum_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(chat_id, is_forum);
+}
 
 impl TelegramOutbound {
     /// Send raw HTML chunks, returning every message id they produced.
@@ -324,6 +386,18 @@ impl ChannelOutbound for TelegramOutbound {
     async fn send_typing(&self, account_id: &str, to: &str) -> Result<()> {
         let bot = self.get_bot(account_id)?;
         let (chat_id, thread_id) = parse_chat_target(to)?;
+        // In a forum supergroup the General topic has no thread id: inbound
+        // messages there arrive without one, so the reply address is the bare
+        // chat id. A chat action sent that way lands in the group's aggregate
+        // entry instead of the General tab the user is reading. Telegram still
+        // routes an action carrying `message_thread_id = 1` to General.
+        let thread_id = match thread_id {
+            Some(tid) => Some(tid),
+            None if chat_is_forum(&bot, chat_id).await => {
+                Some(ThreadId(MessageId(GENERAL_TOPIC_ID)))
+            },
+            None => None,
+        };
         let mut req = bot.send_chat_action(chat_id, ChatAction::Typing);
         if let Some(tid) = thread_id {
             req = req.message_thread_id(tid);

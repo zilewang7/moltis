@@ -8,6 +8,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use {
+    moltis_agents::runner::SteerInbox,
     moltis_channels::{ChannelActivity, ChannelReplyTarget},
     moltis_tools::sandbox::SandboxRouter,
 };
@@ -233,17 +234,37 @@ pub trait ChatRuntime: Send + Sync {
 
     // ── Mid-flight steering ──────────────────────────────────────────────
 
-    /// Take (drain) all pending `/steer` texts for a session.
+    /// Take (drain) all pending steering texts buffered for a session.
+    ///
+    /// Only used to clear leftovers; live delivery goes through the inbox
+    /// registered by the running turn, not this buffer.
     async fn take_steer_text(&self, _session_key: &str) -> Option<Vec<String>> {
         None
     }
 
-    /// Queue steering text for a session's active run.
+    /// Whether this runtime can deliver steering text into a live run.
     ///
-    /// The channel gateway implements this over its in-memory steer map. A
-    /// runtime that does not support steering leaves the default, which drops
-    /// the text: callers must not assume it was delivered.
-    async fn push_steer_text(&self, _session_key: &str, _text: String) {}
+    /// Callers must check this before choosing steering over queueing: a
+    /// runtime without inbox support would otherwise accept the message and
+    /// silently drop it.
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    /// Deliver steering text into the session's running turn.
+    ///
+    /// Returns `true` only when the text was handed to a live run's inbox. On
+    /// `false` the caller must fall back to ordinary queueing — the text was
+    /// not delivered, and pretending otherwise loses the user's message.
+    async fn push_steer_text(&self, _session_key: &str, _text: String) -> bool {
+        false
+    }
+
+    /// Register the inbox of a starting run so `push_steer_text` can reach it.
+    async fn register_steer_inbox(&self, _session_key: &str, _inbox: SteerInbox) {}
+
+    /// Drop a finished run's inbox registration.
+    async fn unregister_steer_inbox(&self, _session_key: &str) {}
 
     /// Check whether fast/priority mode is enabled for a session.
     async fn is_fast_mode(&self, _session_key: &str) -> bool {

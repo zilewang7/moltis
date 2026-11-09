@@ -525,7 +525,14 @@ pub(in crate::channel_events) async fn handle_steer(
         ));
     }
 
-    state.set_steer_text(session_key, args.to_string()).await;
+    // Push straight into the live run's inbox. A `false` here means the run has
+    // no inbox registered (it is already finishing), so reporting success would
+    // be a lie.
+    if !state.push_steer_text(session_key, args.to_string()).await {
+        return Err(ChannelError::invalid_input(
+            "The run is already finishing; send the message again to start a new turn.",
+        ));
+    }
 
     broadcast(
         state,

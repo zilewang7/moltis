@@ -338,8 +338,20 @@ impl ChatRuntime for GatewayChatRuntime {
         self.state.take_steer_text(session_key).await
     }
 
-    async fn push_steer_text(&self, session_key: &str, text: String) {
-        self.state.set_steer_text(session_key, text).await;
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    async fn push_steer_text(&self, session_key: &str, text: String) -> bool {
+        self.state.push_steer_text(session_key, text).await
+    }
+
+    async fn register_steer_inbox(&self, session_key: &str, inbox: moltis_agents::runner::SteerInbox) {
+        self.state.register_steer_inbox(session_key, inbox).await;
+    }
+
+    async fn unregister_steer_inbox(&self, session_key: &str) {
+        self.state.unregister_steer_inbox(session_key).await;
     }
 
     async fn is_fast_mode(&self, session_key: &str) -> bool {

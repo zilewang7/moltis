@@ -343,9 +343,12 @@ pub struct GatewayInner {
     pub channel_command_mode_sessions: HashSet<String>,
     /// Sessions with fast/priority mode enabled.
     pub fast_mode_sessions: HashSet<String>,
-    /// Per-session steering text queue injected mid-run via `/steer`.
-    /// Multiple `/steer` calls accumulate; all are drained on the next poll.
+    /// Per-session steering text buffer, used only for text that arrives while
+    /// no run has registered an inbox. Cleared at the next run's start.
     pub steer_text: HashMap<String, Vec<String>>,
+    /// Inboxes of currently running turns, so steering text is delivered
+    /// straight into the live run instead of being polled for.
+    pub steer_inboxes: HashMap<String, moltis_agents::runner::SteerInbox>,
     /// Which channel types are offered in the web UI (from config).
     pub channels_offered: Vec<String>,
     /// Hostnames that were discovered after passkeys already existed.
@@ -383,6 +386,7 @@ impl GatewayInner {
             channel_command_mode_sessions: HashSet::new(),
             fast_mode_sessions: HashSet::new(),
             steer_text: HashMap::new(),
+            steer_inboxes: HashMap::new(),
             channels_offered: vec![
                 "telegram".into(),
                 "whatsapp".into(),
@@ -902,6 +906,45 @@ impl GatewayState {
             .entry(session_key.to_string())
             .or_default()
             .push(text);
+    }
+
+    /// Register a starting run's steering inbox for a session.
+    pub async fn register_steer_inbox(
+        &self,
+        session_key: &str,
+        inbox: moltis_agents::runner::SteerInbox,
+    ) {
+        self.inner
+            .write()
+            .await
+            .steer_inboxes
+            .insert(session_key.to_string(), inbox);
+    }
+
+    /// Drop a finished run's inbox registration.
+    pub async fn unregister_steer_inbox(&self, session_key: &str) {
+        self.inner.write().await.steer_inboxes.remove(session_key);
+    }
+
+    /// Deliver steering text into the session's live run.
+    ///
+    /// Returns `false` when no run is registered for the session: the caller
+    /// must then treat the message as an ordinary queued turn. Buffering it
+    /// here instead would look delivered while the next run's startup drain
+    /// throws it away.
+    pub async fn push_steer_text(&self, session_key: &str, text: String) -> bool {
+        let inbox = self
+            .inner
+            .read()
+            .await
+            .steer_inboxes
+            .get(session_key)
+            .cloned();
+        let Some(inbox) = inbox else {
+            return false;
+        };
+        inbox.lock().await.push(text);
+        true
     }
 
     /// Take (drain) all pending steering texts for a session.
