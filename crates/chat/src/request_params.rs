@@ -21,10 +21,15 @@
 ///   turn, which skips the channel-bound public ceiling in
 ///   [`crate::service`]. This is the only one of the three that *widens*
 ///   privilege, so it is the one that most needs stripping.
-pub const GATEWAY_OWNED_REQUEST_PARAMS: [&str; 3] = [
+/// - `_channel_turn_trusted` — asserts the gateway resolved this turn as an
+///   operator in a trusted (non-shared) chat, so a queued replay of it keeps its
+///   private context and tools instead of being downgraded to public. Widens
+///   privilege exactly like `_native_channel_request`, so it is stripped too.
+pub const GATEWAY_OWNED_REQUEST_PARAMS: [&str; 4] = [
     "channel",
     "_channel_reply_target",
     "_native_channel_request",
+    "_channel_turn_trusted",
 ];
 
 /// Remove every [`GATEWAY_OWNED_REQUEST_PARAMS`] entry from a request.
@@ -77,6 +82,7 @@ mod tests {
     #[test]
     fn every_gateway_trust_marker_read_by_the_service_is_listed() {
         const CHANNEL_SECURITY: &str = include_str!("service/chat_impl/channel_security.rs");
+        const TOOL_POLICY: &str = include_str!("service/chat_impl/tool_policy.rs");
 
         assert!(
             CHANNEL_SECURITY.contains("_native_channel_request"),
@@ -84,8 +90,15 @@ mod tests {
              trust marker was renamed, update GATEWAY_OWNED_REQUEST_PARAMS to match"
         );
         assert!(
-            GATEWAY_OWNED_REQUEST_PARAMS.contains(&"_native_channel_request"),
-            "the gateway trust marker must be stripped from caller-supplied params"
+            TOOL_POLICY.contains("_channel_turn_trusted"),
+            "tool_policy.rs no longer reads `_channel_turn_trusted`; if the trust \
+             marker was renamed, update GATEWAY_OWNED_REQUEST_PARAMS to match"
         );
+        for marker in ["_native_channel_request", "_channel_turn_trusted"] {
+            assert!(
+                GATEWAY_OWNED_REQUEST_PARAMS.contains(&marker),
+                "gateway trust marker `{marker}` must be stripped from caller-supplied params"
+            );
+        }
     }
 }

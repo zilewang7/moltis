@@ -200,6 +200,14 @@ pub(in crate::channel_events) async fn dispatch_to_chat(
         // narrowing that guard would have silently opened this one.
         if !trusted_channel_turn {
             apply_untrusted_channel_context_with(&mut params, untrusted_audience, untrusted_tools);
+        } else {
+            // Tell `chat.send` that this turn was already resolved as an
+            // operator in a trusted chat, so a queued replay of it keeps its
+            // private context and tools. Without this, a message sent while the
+            // previous run was still finishing came back with an empty filtered
+            // history and no tools — the agent answered "this is a new session,
+            // I have no context" mid-conversation.
+            params["_channel_turn_trusted"] = serde_json::json!(true);
         }
 
         // Carry this message's acknowledgment identity into the run so the

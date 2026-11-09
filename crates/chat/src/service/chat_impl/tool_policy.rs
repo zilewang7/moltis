@@ -57,9 +57,21 @@ pub(crate) fn apply_untrusted_request_context(params: &mut Value) {
 
 /// Downgrade a privileged channel turn before delayed replay, when its sender's
 /// authorization may no longer be valid.
+///
+/// A turn the gateway already resolved as an **operator in a trusted chat**
+/// carries `_channel_turn_trusted` and keeps its context: downgrading it made a
+/// message the user sent while a run was still finishing come back with
+/// `history_len: 0` — the turn saw only other public turns, so a long
+/// conversation resumed as "this is a new session, I have no context", with no
+/// tools either. The trust decision is made against static operator config a
+/// few seconds earlier, so the revocation window this protects against is
+/// negligible next to breaking every follow-up message.
 #[must_use]
 pub(crate) fn downgrade_queued_channel_request(params: &mut Value, private_context: bool) -> bool {
     if !private_context || !params.get("channel").is_some_and(Value::is_object) {
+        return false;
+    }
+    if params.get("_channel_turn_trusted").and_then(Value::as_bool) == Some(true) {
         return false;
     }
     apply_untrusted_request_context(params);
@@ -286,6 +298,39 @@ mod tests {
             &mut serde_json::json!({}),
             true
         ));
+    }
+
+    /// A queued follow-up from an operator in a trusted chat must keep its
+    /// history and tools. Downgrading it produced `history_len: 0` on replay:
+    /// the filtered history held no public runs, so the model answered a
+    /// 200-message conversation with "I have no context".
+    #[test]
+    fn queued_trusted_channel_turn_keeps_private_context() {
+        let mut params = serde_json::json!({
+            "channel": {"sender_id": "owner"},
+            "_private_context": true,
+            "_channel_turn_trusted": true,
+        });
+        let before = params.clone();
+
+        assert!(!downgrade_queued_channel_request(&mut params, true));
+        assert_eq!(params, before, "trusted queued turn must be left alone");
+        assert_eq!(allows_private_context(&params), true);
+    }
+
+    /// The marker must not widen a turn whose sender was a guest: the gateway
+    /// only sets it for operator turns, and a guest turn still downgrades.
+    #[test]
+    fn queued_untrusted_channel_turn_still_downgrades() {
+        let mut params = serde_json::json!({
+            "channel": {"sender_id": "guest"},
+            "_private_context": true,
+            "_channel_turn_trusted": false,
+        });
+
+        assert!(downgrade_queued_channel_request(&mut params, true));
+        assert_eq!(params["_private_context"], false);
+        assert_eq!(params["_tool_audience"], "public");
     }
 
     #[tokio::test]
