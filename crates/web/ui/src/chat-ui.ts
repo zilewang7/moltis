@@ -313,7 +313,44 @@ export function chatAddErrorMsg(message: string): void {
 	chatAddErrorCard(parseErrorMessage(message));
 }
 
+/**
+ * How long an approval request may sit unanswered before the card is drawn.
+ *
+ * The guard judges every request and usually resolves it in 2-8s, so drawing the card
+ * immediately means a card flashes up and then settles for almost every command. Holding it
+ * back means the card only appears when the guard escalated (or when nothing is listening),
+ * i.e. exactly when a human has to decide.
+ */
+const APPROVAL_RENDER_DELAY_MS = 10000;
+/** Mirrors ApprovalManager::default().timeout (120s) so the countdown matches the server. */
+const APPROVAL_TIMEOUT_MS = 120_000;
+/** Bound on remembered outcomes, so a long session cannot leak memory. */
+const SETTLED_APPROVALS_MAX = 200;
+
+/** requestId -> timer that would draw the card. */
+const bufferedApprovalTimers = new Map<string, number>();
+/** requestId -> arrival timestamp, for an accurate countdown after the delay. */
+const approvalArrivals = new Map<string, number>();
+/** requestId -> decision, for requests resolved while still buffered (never drawn). */
+const settledApprovals = new Map<string, string>();
+
 export function renderApprovalCard(requestId: string, command: string): void {
+	if (!requestId || settledApprovals.has(requestId) || bufferedApprovalTimers.has(requestId)) {
+		return;
+	}
+	if (document.getElementById(`approval-${requestId}`)) return;
+	const arrivedAt = Date.now();
+	approvalArrivals.set(requestId, arrivedAt);
+	const timer = window.setTimeout(() => {
+		bufferedApprovalTimers.delete(requestId);
+		approvalArrivals.delete(requestId);
+		if (settledApprovals.has(requestId)) return;
+		renderApprovalCardNow(requestId, command, arrivedAt);
+	}, APPROVAL_RENDER_DELAY_MS);
+	bufferedApprovalTimers.set(requestId, timer);
+}
+
+function renderApprovalCardNow(requestId: string, command: string, arrivedAt: number): void {
 	if (!S.chatMsgBox) return;
 	clearChatEmptyState();
 	const tpl = S.$<HTMLTemplateElement>("tpl-approval-card")!;
@@ -333,7 +370,8 @@ export function renderApprovalCard(requestId: string, command: string): void {
 	};
 
 	const countdown = card.querySelector(".approval-countdown") as HTMLElement;
-	let remaining = 120;
+	// The request has already been waiting out the render delay; do not overstate the time left.
+	let remaining = Math.max(5, Math.ceil((APPROVAL_TIMEOUT_MS - (Date.now() - arrivedAt)) / 1000));
 	const timer = setInterval(() => {
 		remaining--;
 		countdown.textContent = `${remaining}s`;
@@ -363,13 +401,32 @@ export function resolveApproval(requestId: string, decision: string, command: st
 
 /**
  * Settle an approval card that was answered somewhere else (external guard, channel
- * `/approve`, or the request expiring server-side). Does nothing when the card is already
- * settled, so a local click followed by the broadcast echo is harmless.
+ * `/approve`, or the request expiring server-side).
+ *
+ * A request still inside its render delay is dropped outright -- that is the common case
+ * (the guard auto-approved), and drawing a card for it would only clutter the transcript.
  */
 export function markApprovalResolvedExternally(requestId: string, decision: string): void {
-	if (!S.chatMsgBox) return;
+	if (!requestId) return;
+	const buffered = bufferedApprovalTimers.get(requestId);
+	if (buffered !== undefined) {
+		clearTimeout(buffered);
+		bufferedApprovalTimers.delete(requestId);
+		approvalArrivals.delete(requestId);
+	}
+	settledApprovals.set(requestId, decision);
+	while (settledApprovals.size > SETTLED_APPROVALS_MAX) {
+		const oldest = settledApprovals.keys().next();
+		if (oldest.done) break;
+		settledApprovals.delete(oldest.value);
+	}
+	if (buffered !== undefined) return; // never drawn, nothing to clean up
 	const card = document.getElementById(`approval-${requestId}`) as HTMLElement | null;
-	if (card) markApprovalCardResolved(card, decision, true);
+	if (!card) return;
+	markApprovalCardResolved(card, decision, true);
+	// Already on screen and answered by someone else: take it away again after a beat so it
+	// stops occupying the transcript.
+	setTimeout(() => card.remove(), 1200);
 }
 
 function markApprovalCardResolved(card: HTMLElement, decision: string, external: boolean): void {
