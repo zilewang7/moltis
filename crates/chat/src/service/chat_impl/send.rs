@@ -10,6 +10,8 @@ use {
 
 use moltis_service_traits::ServiceResult;
 
+use moltis_config::MessageQueueMode;
+
 #[cfg(feature = "local-llm")]
 use moltis_providers::model_id::raw_model_id;
 
@@ -173,7 +175,51 @@ impl LiveChatService {
             "chat.send: received"
         );
 
-        let message_queue_mode = self.config.chat.message_queue_mode;
+        let message_queue_mode = resolve_queue_mode(self.config.chat.message_queue_mode, &params);
+
+        // Mid-flight steering. With `message_queue_mode = "steer"` a plain-text
+        // message that arrives while this session already has a run is delivered
+        // into that run instead of waiting for it: the runner drains the steer
+        // inbox after every tool batch and injects it as guidance, so the user
+        // can redirect work in progress instead of queueing behind it.
+        //
+        // The text is ALSO persisted as a user message. The in-run injection is a
+        // `system` note, and the approval judge builds its "what did the user
+        // actually ask for" evidence from `chat.history` filtered to user and
+        // assistant text — a system note is invisible there, so a steer that only
+        // lived in the run would leave the judge blind to the instruction that
+        // authorized the very commands it is judging.
+        //
+        // Media and `/sh` are excluded: steering carries text guidance only, and
+        // anything else keeps the existing queueing behaviour.
+        if queue_if_busy
+            && explicit_shell_command.is_none()
+            && !queued_replay
+            && !ephemeral
+            && message_queue_mode == MessageQueueMode::Steer
+            && params.get("content").is_none()
+            && self.session_has_active_turn(&session_key).await
+        {
+            let active_run_id = self
+                .active_runs_by_session
+                .read()
+                .await
+                .get(&session_key)
+                .cloned();
+            let steer_message = PersistedMessage::User {
+                content: MessageContent::Text(text.clone()),
+                created_at: Some(now_ms()),
+                audio: None,
+                documents: None,
+                channel: params.get("channel").cloned(),
+                seq: client_seq,
+                run_id: active_run_id,
+            };
+            return self
+                .steer_active_turn(&session_key, steer_message, &text)
+                .await;
+        }
+
         let admission = if queue_if_busy && explicit_shell_command.is_none() {
             let mut queued_params = params.clone();
             // Delayed channel turns cannot retain authorization that may be
@@ -1470,5 +1516,110 @@ impl LiveChatService {
             "chat.send: returning run id"
         );
         Ok(serde_json::json!({ "ok": true, "runId": run_id }))
+    }
+
+    /// Deliver a message into the session's active run as steering guidance.
+    ///
+    /// Two things must happen together, and the order matters: persist first so
+    /// the transcript (and the approval judge reading `chat.history`) has the
+    /// instruction even if the run ends before it drains the inbox, then push the
+    /// text so the runner picks it up after its current tool batch.
+    async fn steer_active_turn(
+        &self,
+        session_key: &str,
+        message: PersistedMessage,
+        text: &str,
+    ) -> ServiceResult {
+        if let Err(error) = self
+            .session_store
+            .append(session_key, &message.to_value())
+            .await
+        {
+            warn!(
+                session = %session_key,
+                %error,
+                "failed to persist steering message"
+            );
+        }
+        let _ = self.session_metadata.upsert(session_key, None).await;
+
+        self.state
+            .push_steer_text(session_key, text.to_string())
+            .await;
+
+        broadcast(
+            &self.state,
+            "chat",
+            serde_json::json!({
+                "sessionKey": session_key,
+                "state": "steered",
+                "text": text,
+            }),
+            BroadcastOpts {
+                drop_if_slow: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        info!(
+            session = %session_key,
+            bytes = text.len(),
+            "chat.send: steered into the active run"
+        );
+        Ok(serde_json::json!({ "ok": true, "steered": true }))
+    }
+}
+
+/// Resolve how a busy session treats this request.
+///
+/// `_queue_mode` lets a caller override the configured behaviour for one
+/// message: `/queue` uses it to force real queueing even when the default is
+/// steering. Only the queueing behaviour is affected, never privilege.
+fn resolve_queue_mode(configured: MessageQueueMode, params: &Value) -> MessageQueueMode {
+    match params.get("_queue_mode").and_then(Value::as_str) {
+        Some("followup") => MessageQueueMode::Followup,
+        Some("collect") => MessageQueueMode::Collect,
+        Some("steer") => MessageQueueMode::Steer,
+        _ => configured,
+    }
+}
+
+#[cfg(test)]
+mod queue_mode_tests {
+    use {
+        super::{MessageQueueMode, resolve_queue_mode},
+        serde_json::json,
+    };
+
+    /// `/queue` must keep queueing even when steering is the configured default.
+    #[test]
+    fn explicit_queue_mode_overrides_the_configured_default() {
+        let params = json!({ "_queue_mode": "followup" });
+        assert_eq!(
+            resolve_queue_mode(MessageQueueMode::Steer, &params),
+            MessageQueueMode::Followup
+        );
+        assert_eq!(
+            resolve_queue_mode(MessageQueueMode::Followup, &json!({})),
+            MessageQueueMode::Followup
+        );
+        assert_eq!(
+            resolve_queue_mode(MessageQueueMode::Steer, &json!({})),
+            MessageQueueMode::Steer
+        );
+        // Unknown or malformed values fall back to the configured behaviour
+        // rather than guessing.
+        assert_eq!(
+            resolve_queue_mode(
+                MessageQueueMode::Collect,
+                &json!({ "_queue_mode": "nonsense" })
+            ),
+            MessageQueueMode::Collect
+        );
+        assert_eq!(
+            resolve_queue_mode(MessageQueueMode::Collect, &json!({ "_queue_mode": 7 })),
+            MessageQueueMode::Collect
+        );
     }
 }

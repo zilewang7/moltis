@@ -338,6 +338,10 @@ impl ChatRuntime for GatewayChatRuntime {
         self.state.take_steer_text(session_key).await
     }
 
+    async fn push_steer_text(&self, session_key: &str, text: String) {
+        self.state.set_steer_text(session_key, text).await;
+    }
+
     async fn is_fast_mode(&self, session_key: &str) -> bool {
         self.state.is_fast_mode(session_key).await
     }

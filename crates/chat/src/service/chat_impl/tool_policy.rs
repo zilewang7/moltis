@@ -315,7 +315,7 @@ mod tests {
 
         assert!(!downgrade_queued_channel_request(&mut params, true));
         assert_eq!(params, before, "trusted queued turn must be left alone");
-        assert_eq!(allows_private_context(&params), true);
+        assert!(allows_private_context(&params));
     }
 
     /// The marker must not widen a turn whose sender was a guest: the gateway

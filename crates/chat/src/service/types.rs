@@ -531,6 +531,23 @@ impl LiveChatService {
         )
     }
 
+    /// Whether this session currently has a run holding its turn permit.
+    ///
+    /// The permit is the single source of truth for "a turn is running": it is
+    /// held from admission until the run finishes, so a queued message and a
+    /// running message are distinguished the same way `admit_turn` does it.
+    /// Probes by taking and immediately dropping the permit.
+    pub(in crate::service) async fn session_has_active_turn(&self, key: &str) -> bool {
+        let sem = self.session_semaphore(key).await;
+        match sem.try_acquire() {
+            Ok(permit) => {
+                drop(permit);
+                false
+            },
+            Err(_) => true,
+        }
+    }
+
     /// Arbitrate the permit and FIFO under one queue lock. Ordinary arrivals
     /// cannot pass queued work, while the drainer's replay can consume its
     /// reservation. If that replay cannot acquire, it returns to the front.

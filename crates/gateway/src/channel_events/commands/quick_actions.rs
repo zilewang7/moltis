@@ -578,6 +578,9 @@ pub(in crate::channel_events) async fn handle_queue(
         "_session_key": session_key,
         "_channel_reply_target": reply_to,
         "_native_channel_request": true,
+        // `/queue` means "do not interrupt": force real queueing even when the
+        // configured default is steering.
+        "_queue_mode": "followup",
         "channel": {
             "channel_type": reply_to.channel_type,
             "sender_id": sender_id,

@@ -296,6 +296,12 @@ pub enum MessageQueueMode {
     Followup,
     /// Buffer messages; concatenate and process as a single message after the current run.
     Collect,
+    /// Deliver the message into the active run as steering guidance instead of
+    /// waiting for it to finish. Falls back to [`Self::Followup`] when nothing
+    /// is running. The text is still persisted as a user message so the
+    /// transcript (and the approval judge, which reads user/assistant text from
+    /// `chat.history`) shows what was said.
+    Steer,
 }
 
 /// How prompt memory is loaded across turns in the same session.

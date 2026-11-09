@@ -61,7 +61,9 @@ pub(super) async fn drain_and_replay(
         }
 
         let (replay_params, keys) = match mode {
-            MessageQueueMode::Followup => {
+            // Steering never queues, so anything left in the queue drains as a
+            // normal follow-up turn.
+            MessageQueueMode::Followup | MessageQueueMode::Steer => {
                 let Some(first) = queued.into_iter().next() else {
                     continue;
                 };
@@ -100,7 +102,11 @@ async fn take_next(
     };
     queue.draining = true;
     match mode {
-        MessageQueueMode::Followup => queue.messages.pop_front().into_iter().collect(),
+        // Steering never enqueues, so a queue drained under it holds ordinary
+        // follow-up messages and is replayed one at a time.
+        MessageQueueMode::Followup | MessageQueueMode::Steer => {
+            queue.messages.pop_front().into_iter().collect()
+        },
         MessageQueueMode::Collect => {
             let queued = queue.messages.drain(..).collect();
             let (group, rest) = super::tool_policy::split_by_request_security_context(queued);

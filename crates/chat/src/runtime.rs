@@ -238,6 +238,13 @@ pub trait ChatRuntime: Send + Sync {
         None
     }
 
+    /// Queue steering text for a session's active run.
+    ///
+    /// The channel gateway implements this over its in-memory steer map. A
+    /// runtime that does not support steering leaves the default, which drops
+    /// the text: callers must not assume it was delivered.
+    async fn push_steer_text(&self, _session_key: &str, _text: String) {}
+
     /// Check whether fast/priority mode is enabled for a session.
     async fn is_fast_mode(&self, _session_key: &str) -> bool {
         false
