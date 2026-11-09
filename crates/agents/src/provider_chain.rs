@@ -60,6 +60,18 @@ impl ProviderErrorKind {
                 | Self::Unknown
         )
     }
+
+    /// Whether this error is worth re-trying against the **same** provider
+    /// before rotating down the chain.
+    ///
+    /// A Cloudflare edge in front of an OpenAI-compatible gateway answers 52x
+    /// when the origin is slow, restarting or briefly unreachable. Those blips
+    /// clear in seconds, so retrying the selected model keeps the user on the
+    /// model they chose instead of silently switching to a fallback.
+    #[must_use]
+    pub fn is_transient(self) -> bool {
+        matches!(self, Self::RateLimit | Self::ServerError | Self::Unknown)
+    }
 }
 
 /// Error patterns for context window overflow (reused from runner.rs).
@@ -120,15 +132,32 @@ pub fn classify_error(err: &anyhow::Error) -> ProviderErrorKind {
         return ProviderErrorKind::BillingExhausted;
     }
 
-    // Server errors.
+    // Server errors. 52x is Cloudflare: 520–525 mean the edge could not get a
+    // usable answer from the origin (524 in particular is the 100 s upstream
+    // timeout). They are transient — the origin usually answers a retry.
     if msg.contains("500")
         || msg.contains("502")
         || msg.contains("503")
         || msg.contains("504")
+        || msg.contains("520")
+        || msg.contains("521")
+        || msg.contains("522")
+        || msg.contains("523")
+        || msg.contains("524")
+        || msg.contains("525")
         || msg.contains("internal server error")
         || msg.contains("bad gateway")
         || msg.contains("service unavailable")
         || msg.contains("overloaded")
+        || msg.contains("timeout")
+        || msg.contains("timed out")
+        || msg.contains("connection reset")
+        || msg.contains("connection closed")
+        || msg.contains("connection aborted")
+        || msg.contains("broken pipe")
+        || msg.contains("unexpected eof")
+        || msg.contains("error sending request")
+        || msg.contains("no data for")
     {
         return ProviderErrorKind::ServerError;
     }
@@ -142,6 +171,35 @@ pub fn classify_error(err: &anyhow::Error) -> ProviderErrorKind {
 }
 
 // ── Circuit breaker (same pattern as embeddings_fallback.rs) ─────────────
+
+// ── Transient-failure retries ────────────────────────────────────────────────
+
+/// How many attempts the same provider entry gets before the chain rotates.
+///
+/// Override with `MOLTIS_PROVIDER_RETRY_ATTEMPTS` (1 disables retries).
+fn transient_retry_attempts() -> usize {
+    env_usize("MOLTIS_PROVIDER_RETRY_ATTEMPTS")
+        .unwrap_or(3)
+        .clamp(1, 6)
+}
+
+/// Give up on a provider whose stream has produced nothing for this long.
+///
+/// A hung upstream otherwise sits silent until the whole agent run hits its
+/// wall clock, which loses the turn. 180 s is comfortably longer than the
+/// slowest first token on a reasoning model, and far shorter than the run
+/// budget. `MOLTIS_PROVIDER_STREAM_IDLE_SECS=0` disables the watchdog.
+fn stream_idle_timeout() -> Option<Duration> {
+    match env_usize("MOLTIS_PROVIDER_STREAM_IDLE_SECS") {
+        Some(0) => None,
+        Some(secs) => Some(Duration::from_secs(secs as u64)),
+        None => Some(Duration::from_secs(180)),
+    }
+}
+
+fn env_usize(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.trim().parse().ok()
+}
 
 /// Circuit breaker state for a single provider.
 struct ProviderState {
@@ -196,11 +254,36 @@ struct ChainEntry {
 /// Implements `LlmProvider` itself so callers don't need to know about failover.
 pub struct ProviderChain {
     chain: Vec<ChainEntry>,
+    /// Same-provider attempts before rotating down the chain (1 = no retries).
+    retry_attempts: usize,
+    /// Base backoff in milliseconds; 0 makes retries immediate.
+    retry_base_ms: u64,
+    /// Drop a stream that sends nothing for this long, treat it as transient.
+    stream_idle: Option<Duration>,
 }
 
 impl ProviderChain {
     /// Build a chain from a list of providers (primary first, then fallbacks).
     pub fn new(providers: Vec<Arc<dyn LlmProvider>>) -> Self {
+        Self::with_retry_policy(
+            providers,
+            transient_retry_attempts(),
+            env_usize("MOLTIS_PROVIDER_RETRY_BASE_MS").unwrap_or(1000) as u64,
+            stream_idle_timeout(),
+        )
+    }
+
+    /// Build a chain with an explicit retry policy.
+    ///
+    /// Used by tests to pin the policy: `retry_attempts == 1` disables
+    /// same-provider retries, `retry_base_ms == 0` removes the backoff wait and
+    /// `stream_idle == None` disables the idle watchdog.
+    pub fn with_retry_policy(
+        providers: Vec<Arc<dyn LlmProvider>>,
+        retry_attempts: usize,
+        retry_base_ms: u64,
+        stream_idle: Option<Duration>,
+    ) -> Self {
         let chain = providers
             .into_iter()
             .map(|provider| ChainEntry {
@@ -208,12 +291,29 @@ impl ProviderChain {
                 state: ProviderState::new(),
             })
             .collect();
-        Self { chain }
+        Self {
+            chain,
+            retry_attempts: retry_attempts.max(1),
+            retry_base_ms,
+            stream_idle,
+        }
     }
 
     /// Build a chain with one provider (no failover). Useful as a passthrough.
     pub fn single(provider: Arc<dyn LlmProvider>) -> Self {
         Self::new(vec![provider])
+    }
+
+    /// Backoff before retrying the same entry: base, 3×base, 7×base, …
+    fn retry_delay(&self, attempt: usize) -> Duration {
+        if self.retry_base_ms == 0 {
+            return Duration::ZERO;
+        }
+        let multiplier = 2u64.saturating_pow(u32::try_from(attempt).unwrap_or(1));
+        Duration::from_millis(
+            self.retry_base_ms
+                .saturating_mul(multiplier.saturating_sub(1)),
+        )
     }
 
     fn primary(&self) -> &ChainEntry {
@@ -236,74 +336,117 @@ impl ProviderChain {
                 }
 
                 let identity = ProviderIdentity::new(entry.provider.name(), entry.provider.id());
-                yield TrackedStreamEvent::Attempt(ProviderAttemptEvent::Started(
-                    identity.clone(),
-                ));
+                let max_attempts = self.retry_attempts;
+                let mut attempt = 1usize;
 
-                let mut stream = entry.provider.stream_with_tools_and_options(
-                    messages.clone(),
-                    tools.clone(),
-                    options.clone(),
-                );
-                let mut emitted_output = false;
-                let mut retry_next = false;
+                'entry: loop {
+                    yield TrackedStreamEvent::Attempt(ProviderAttemptEvent::Started(
+                        identity.clone(),
+                    ));
 
-                while let Some(event) = stream.next().await {
-                    match event {
-                        StreamEvent::Error(error) => {
-                            let anyhow_error = anyhow::anyhow!(error.clone());
-                            let kind = classify_error(&anyhow_error);
+                    let mut stream = entry.provider.stream_with_tools_and_options(
+                        messages.clone(),
+                        tools.clone(),
+                        options.clone(),
+                    );
+                    let mut emitted_output = false;
+                    let mut failure: Option<(String, ProviderErrorKind)> = None;
+
+                    loop {
+                        let next = match self.stream_idle {
+                            Some(idle) => match tokio::time::timeout(idle, stream.next()).await {
+                                Ok(item) => item,
+                                Err(_) => Some(StreamEvent::Error(format!(
+                                    "provider stream sent no data for {}s",
+                                    idle.as_secs()
+                                ))),
+                            },
+                            None => stream.next().await,
+                        };
+                        let Some(event) = next else { break };
+                        match event {
+                            StreamEvent::Error(error) => {
+                                let anyhow_error = anyhow::anyhow!(error.clone());
+                                let kind = classify_error(&anyhow_error);
+                                entry.state.record_failure();
+                                yield TrackedStreamEvent::Attempt(ProviderAttemptEvent::Failed {
+                                    identity: identity.clone(),
+                                    error: error.clone(),
+                                });
+
+                                if kind.should_failover() && !emitted_output {
+                                    failure = Some((error, kind));
+                                    break;
+                                }
+
+                                yield TrackedStreamEvent::Event(StreamEvent::Error(error));
+                                return;
+                            },
+                            StreamEvent::Done(usage) => {
+                                entry.state.record_success();
+                                yield TrackedStreamEvent::Event(StreamEvent::Done(usage));
+                                return;
+                            },
+                            StreamEvent::ProviderRaw(raw) => {
+                                yield TrackedStreamEvent::Event(StreamEvent::ProviderRaw(raw));
+                            },
+                            event => {
+                                emitted_output = true;
+                                yield TrackedStreamEvent::Event(event);
+                            },
+                        }
+                    }
+
+                    let (error, kind) = match failure {
+                        Some(failure) => failure,
+                        None => {
+                            let error = "provider stream ended without a terminal event".to_string();
+                            if emitted_output {
+                                entry.state.record_failure();
+                                yield TrackedStreamEvent::Attempt(ProviderAttemptEvent::Failed {
+                                    identity: identity.clone(),
+                                    error: error.clone(),
+                                });
+                                yield TrackedStreamEvent::Event(StreamEvent::Error(error));
+                                return;
+                            }
                             entry.state.record_failure();
                             yield TrackedStreamEvent::Attempt(ProviderAttemptEvent::Failed {
                                 identity: identity.clone(),
                                 error: error.clone(),
                             });
+                            (error, ProviderErrorKind::Unknown)
+                        },
+                    };
 
-                            if kind.should_failover() && !emitted_output {
-                                warn!(
-                                    provider = entry.provider.id(),
-                                    error = %error,
-                                    kind = ?kind,
-                                    "provider stream failed, trying next in chain"
-                                );
-                                errors.push(format!("{}: {error}", entry.provider.id()));
-                                retry_next = true;
-                                break;
-                            }
-
-                            yield TrackedStreamEvent::Event(StreamEvent::Error(error));
-                            return;
-                        },
-                        StreamEvent::Done(usage) => {
-                            entry.state.record_success();
-                            yield TrackedStreamEvent::Event(StreamEvent::Done(usage));
-                            return;
-                        },
-                        StreamEvent::ProviderRaw(raw) => {
-                            yield TrackedStreamEvent::Event(StreamEvent::ProviderRaw(raw));
-                        },
-                        event => {
-                            emitted_output = true;
-                            yield TrackedStreamEvent::Event(event);
-                        },
+                    if kind.is_transient() && attempt < max_attempts {
+                        let delay = self.retry_delay(attempt);
+                        warn!(
+                            provider = entry.provider.id(),
+                            error = %error,
+                            kind = ?kind,
+                            attempt,
+                            max_attempts,
+                            delay_ms = delay.as_millis(),
+                            "provider stream failed, retrying the same provider"
+                        );
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        attempt += 1;
+                        continue 'entry;
                     }
-                }
 
-                if retry_next {
-                    continue;
+                    warn!(
+                        provider = entry.provider.id(),
+                        error = %error,
+                        kind = ?kind,
+                        attempts = attempt,
+                        "provider stream failed, trying next in chain"
+                    );
+                    errors.push(format!("{}: {error}", entry.provider.id()));
+                    break 'entry;
                 }
-
-                let error = "provider stream ended without a terminal event".to_string();
-                entry.state.record_failure();
-                yield TrackedStreamEvent::Attempt(ProviderAttemptEvent::Failed {
-                    identity: identity.clone(),
-                    error: error.clone(),
-                });
-                if emitted_output {
-                    yield TrackedStreamEvent::Event(StreamEvent::Error(error));
-                    return;
-                }
-                errors.push(format!("{}: {error}", entry.provider.id()));
             }
 
             yield TrackedStreamEvent::Event(StreamEvent::Error(format!(
@@ -371,94 +514,118 @@ impl LlmProvider for ProviderChain {
 
             let provider_name = entry.provider.name().to_string();
             let model_id = entry.provider.id().to_string();
+            let max_attempts = self.retry_attempts;
+            let mut attempt = 1usize;
 
-            match entry
-                .provider
-                .complete_with_options_tracked(messages, tools, options, on_attempt)
-                .await
-            {
-                Ok(resp) => {
-                    entry.state.record_success();
+            loop {
+                match entry
+                    .provider
+                    .complete_with_options_tracked(messages, tools, options, &mut *on_attempt)
+                    .await
+                {
+                    Ok(resp) => {
+                        entry.state.record_success();
 
-                    // Record metrics on successful completion
-                    #[cfg(feature = "metrics")]
-                    {
-                        let duration = start.elapsed().as_secs_f64();
+                        // Record metrics on successful completion
+                        #[cfg(feature = "metrics")]
+                        {
+                            let duration = start.elapsed().as_secs_f64();
 
-                        counter!(
-                            llm_metrics::COMPLETIONS_TOTAL,
-                            labels::PROVIDER => provider_name.clone(),
-                            labels::MODEL => model_id.clone()
-                        )
-                        .increment(1);
+                            counter!(
+                                llm_metrics::COMPLETIONS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(1);
 
-                        counter!(
-                            llm_metrics::INPUT_TOKENS_TOTAL,
-                            labels::PROVIDER => provider_name.clone(),
-                            labels::MODEL => model_id.clone()
-                        )
-                        .increment(u64::from(resp.usage.input_tokens));
+                            counter!(
+                                llm_metrics::INPUT_TOKENS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(u64::from(resp.usage.input_tokens));
 
-                        counter!(
-                            llm_metrics::OUTPUT_TOKENS_TOTAL,
-                            labels::PROVIDER => provider_name.clone(),
-                            labels::MODEL => model_id.clone()
-                        )
-                        .increment(u64::from(resp.usage.output_tokens));
+                            counter!(
+                                llm_metrics::OUTPUT_TOKENS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(u64::from(resp.usage.output_tokens));
 
-                        counter!(
-                            llm_metrics::CACHE_READ_TOKENS_TOTAL,
-                            labels::PROVIDER => provider_name.clone(),
-                            labels::MODEL => model_id.clone()
-                        )
-                        .increment(u64::from(resp.usage.cache_read_tokens));
+                            counter!(
+                                llm_metrics::CACHE_READ_TOKENS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(u64::from(resp.usage.cache_read_tokens));
 
-                        counter!(
-                            llm_metrics::CACHE_WRITE_TOKENS_TOTAL,
-                            labels::PROVIDER => provider_name.clone(),
-                            labels::MODEL => model_id.clone()
-                        )
-                        .increment(u64::from(resp.usage.cache_write_tokens));
+                            counter!(
+                                llm_metrics::CACHE_WRITE_TOKENS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone()
+                            )
+                            .increment(u64::from(resp.usage.cache_write_tokens));
 
-                        histogram!(
-                            llm_metrics::COMPLETION_DURATION_SECONDS,
-                            labels::PROVIDER => provider_name,
-                            labels::MODEL => model_id
-                        )
-                        .record(duration);
-                    }
+                            histogram!(
+                                llm_metrics::COMPLETION_DURATION_SECONDS,
+                                labels::PROVIDER => provider_name,
+                                labels::MODEL => model_id
+                            )
+                            .record(duration);
+                        }
 
-                    return Ok(resp);
-                },
-                Err(e) => {
-                    let kind = classify_error(&e);
-                    entry.state.record_failure();
+                        return Ok(resp);
+                    },
+                    Err(e) => {
+                        let kind = classify_error(&e);
+                        entry.state.record_failure();
 
-                    // Record error metrics
-                    #[cfg(feature = "metrics")]
-                    {
-                        counter!(
-                            llm_metrics::COMPLETION_ERRORS_TOTAL,
-                            labels::PROVIDER => provider_name.clone(),
-                            labels::MODEL => model_id.clone(),
-                            labels::ERROR_TYPE => format!("{kind:?}")
-                        )
-                        .increment(1);
-                    }
+                        // Record error metrics
+                        #[cfg(feature = "metrics")]
+                        {
+                            counter!(
+                                llm_metrics::COMPLETION_ERRORS_TOTAL,
+                                labels::PROVIDER => provider_name.clone(),
+                                labels::MODEL => model_id.clone(),
+                                labels::ERROR_TYPE => format!("{kind:?}")
+                            )
+                            .increment(1);
+                        }
 
-                    if !kind.should_failover() {
-                        // Non-retryable error — propagate immediately.
-                        return Err(e);
-                    }
+                        if !kind.should_failover() {
+                            // Non-retryable error — propagate immediately.
+                            return Err(e);
+                        }
 
-                    warn!(
-                        provider = entry.provider.id(),
-                        error = %e,
-                        kind = ?kind,
-                        "provider failed, trying next in chain"
-                    );
-                    errors.push(format!("{}: {e}", entry.provider.id()));
-                },
+                        if kind.is_transient() && attempt < max_attempts {
+                            let delay = self.retry_delay(attempt);
+                            warn!(
+                                provider = entry.provider.id(),
+                                error = %e,
+                                kind = ?kind,
+                                attempt,
+                                max_attempts,
+                                delay_ms = delay.as_millis(),
+                                "provider failed, retrying the same provider"
+                            );
+                            if !delay.is_zero() {
+                                tokio::time::sleep(delay).await;
+                            }
+                            attempt += 1;
+                            continue;
+                        }
+
+                        warn!(
+                            provider = entry.provider.id(),
+                            error = %e,
+                            kind = ?kind,
+                            attempts = attempt,
+                            "provider failed, trying next in chain"
+                        );
+                        errors.push(format!("{}: {e}", entry.provider.id()));
+                        break;
+                    },
+                }
             }
         }
 
@@ -602,8 +769,176 @@ mod tests {
         }
     }
 
-    struct EmptyStreamProvider;
+    /// A mock provider that fails `failures` times, then succeeds. Each call
+    /// (stream or complete) counts as one attempt.
+    struct FlakyProvider {
+        id: &'static str,
+        failures: usize,
+        calls: AtomicUsize,
+    }
 
+    impl FlakyProvider {
+        fn new(id: &'static str, failures: usize) -> Self {
+            Self {
+                id,
+                failures,
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn should_fail(&self) -> bool {
+            self.calls.fetch_add(1, Ordering::SeqCst) < self.failures
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for FlakyProvider {
+        fn name(&self) -> &str {
+            "flaky"
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> anyhow::Result<CompletionResponse> {
+            if self.should_fail() {
+                anyhow::bail!("HTTP 524: error code: 524");
+            }
+            Ok(CompletionResponse {
+                reasoning: None,
+                text: Some("primary ok".into()),
+                tool_calls: vec![],
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    ..Default::default()
+                },
+            })
+        }
+
+        fn stream(
+            &self,
+            _messages: Vec<ChatMessage>,
+        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send + '_>> {
+            if self.should_fail() {
+                Box::pin(tokio_stream::once(StreamEvent::Error(
+                    "HTTP 524: error code: 524".into(),
+                )))
+            } else {
+                Box::pin(tokio_stream::once(StreamEvent::Done(Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    ..Default::default()
+                })))
+            }
+        }
+    }
+
+    /// Build a chain whose retries are instant so tests do not sleep.
+    fn test_chain(providers: Vec<Arc<dyn LlmProvider>>, retry_attempts: usize) -> ProviderChain {
+        ProviderChain::with_retry_policy(providers, retry_attempts, 0, None)
+    }
+
+    /// A transient 524 on the primary must be retried on the primary itself,
+    /// not silently answered by the fallback model.
+    #[tokio::test]
+    async fn stream_retries_same_provider_before_rotating() {
+        let chain = test_chain(
+            vec![
+                Arc::new(FlakyProvider::new("primary", 2)),
+                Arc::new(SuccessProvider { id: "fallback" }),
+            ],
+            3,
+        );
+
+        let events = chain
+            .stream_with_tools_and_options_tracked(vec![], vec![], AgentToolControls::default())
+            .collect::<Vec<_>>()
+            .await;
+
+        let started: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                TrackedStreamEvent::Attempt(ProviderAttemptEvent::Started(identity)) => {
+                    Some(identity.model.clone())
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, vec!["primary", "primary", "primary"]);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                TrackedStreamEvent::Attempt(ProviderAttemptEvent::Started(identity))
+                    if identity.model == "fallback"
+            )),
+            "fallback must not be used when the retry succeeds"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(TrackedStreamEvent::Event(StreamEvent::Done(_)))
+        ));
+    }
+
+    /// Same guarantee for the non-streaming path.
+    #[tokio::test]
+    async fn complete_retries_same_provider_before_rotating() {
+        let chain = test_chain(
+            vec![
+                Arc::new(FlakyProvider::new("primary", 1)),
+                Arc::new(SuccessProvider { id: "fallback" }),
+            ],
+            3,
+        );
+
+        let response = chain.complete(&[], &[]).await.unwrap();
+        assert_eq!(response.text.as_deref(), Some("primary ok"));
+    }
+
+    /// Once retries are exhausted the chain still rotates, and the error it
+    /// reports names the attempts that were made.
+    #[tokio::test]
+    async fn exhausted_retries_still_fail_over() {
+        let chain = test_chain(
+            vec![
+                Arc::new(FailingProvider {
+                    id: "primary",
+                    error_msg: "HTTP 524: error code: 524",
+                }),
+                Arc::new(SuccessProvider { id: "fallback" }),
+            ],
+            3,
+        );
+
+        let events = chain
+            .stream_with_tools_and_options_tracked(vec![], vec![], AgentToolControls::default())
+            .collect::<Vec<_>>()
+            .await;
+
+        let primary_attempts = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    TrackedStreamEvent::Attempt(ProviderAttemptEvent::Started(identity))
+                        if identity.model == "primary"
+                )
+            })
+            .count();
+        assert_eq!(primary_attempts, 3);
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TrackedStreamEvent::Event(StreamEvent::Done(_))))
+        );
+    }
+
+    struct EmptyStreamProvider;
     #[async_trait]
     impl LlmProvider for EmptyStreamProvider {
         fn name(&self) -> &str {
@@ -658,13 +993,18 @@ mod tests {
 
     #[tokio::test]
     async fn non_streaming_attempts_report_fallback_identity() {
-        let chain = ProviderChain::new(vec![
-            Arc::new(FailingProvider {
-                id: "primary",
-                error_msg: "429 rate limit exceeded",
-            }),
-            Arc::new(SuccessProvider { id: "fallback" }),
-        ]);
+        let chain = ProviderChain::with_retry_policy(
+            vec![
+                Arc::new(FailingProvider {
+                    id: "primary",
+                    error_msg: "429 rate limit exceeded",
+                }),
+                Arc::new(SuccessProvider { id: "fallback" }),
+            ],
+            1,
+            0,
+            None,
+        );
         let mut attempts = Vec::new();
 
         let response = chain
@@ -819,13 +1159,18 @@ mod tests {
 
     #[tokio::test]
     async fn stream_error_fails_over_and_records_attempts() {
-        let chain = ProviderChain::new(vec![
-            Arc::new(FailingProvider {
-                id: "primary",
-                error_msg: "503 service unavailable",
-            }),
-            Arc::new(SuccessProvider { id: "fallback" }),
-        ]);
+        let chain = ProviderChain::with_retry_policy(
+            vec![
+                Arc::new(FailingProvider {
+                    id: "primary",
+                    error_msg: "503 service unavailable",
+                }),
+                Arc::new(SuccessProvider { id: "fallback" }),
+            ],
+            1,
+            0,
+            None,
+        );
 
         let events = chain
             .stream_with_tools_and_options_tracked(vec![], vec![], AgentToolControls::default())
@@ -979,8 +1324,30 @@ mod tests {
 
     #[test]
     fn classify_unknown() {
-        let err = anyhow::anyhow!("connection reset by peer");
+        let err = anyhow::anyhow!("totally unexpected provider hiccup");
         assert_eq!(classify_error(&err), ProviderErrorKind::Unknown);
+    }
+
+    /// A Cloudflare 524 used to fall through as `Unknown`; it must be retried
+    /// like any other transient 5xx, and network-level failures too.
+    #[test]
+    fn classify_transient_network_errors() {
+        for message in [
+            "HTTP 524: error code: 524",
+            "HTTP 522: Connection timed out",
+            "HTTP 503: Service temporarily unavailable",
+            "error sending request for url (https://example.test/v1/chat/completions)",
+            "connection reset by peer",
+            "provider stream sent no data for 180s",
+        ] {
+            let kind = classify_error(&anyhow::anyhow!(message));
+            assert_eq!(kind, ProviderErrorKind::ServerError, "{message}");
+            assert!(kind.is_transient(), "{message}");
+            assert!(kind.should_failover(), "{message}");
+        }
+        assert!(!ProviderErrorKind::AuthError.is_transient());
+        assert!(!ProviderErrorKind::InvalidRequest.is_transient());
+        assert!(!ProviderErrorKind::ContextWindow.is_transient());
     }
 
     #[test]

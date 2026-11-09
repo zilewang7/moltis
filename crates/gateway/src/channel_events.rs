@@ -408,7 +408,10 @@ fn start_channel_typing_loop(
     let outbound = state.services.channel_outbound_arc()?;
     let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
     let account_id = reply_to.account_id.clone();
-    let chat_id = reply_to.chat_id.clone();
+    // Use the full outbound address, not the bare chat id: a Telegram forum
+    // topic needs `chat_id:thread_id` or the chat action lands in the group's
+    // General topic instead of the thread the user is actually reading.
+    let chat_id = reply_to.outbound_to().into_owned();
 
     tokio::spawn(async move {
         loop {

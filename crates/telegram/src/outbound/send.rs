@@ -328,7 +328,14 @@ impl ChannelOutbound for TelegramOutbound {
         if let Some(tid) = thread_id {
             req = req.message_thread_id(tid);
         }
-        let _ = req.await;
+        // Surface failures so the gateway's typing-loop log shows a chat that
+        // refuses the action, instead of silently showing no indicator.
+        if let Err(e) = req.await {
+            return Err(moltis_channels::Error::External {
+                context: format!("telegram send_chat_action to {to}"),
+                source: Box::new(e),
+            });
+        }
         Ok(())
     }
 
