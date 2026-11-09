@@ -345,6 +345,8 @@ export function renderApprovalCard(requestId: string, command: string): void {
 			countdown.textContent = "expired";
 		}
 	}, 1000);
+	// Kept on the element so an external resolution (guard, channel /approve) can stop it.
+	card.dataset.approvalTimer = String(timer as unknown as number);
 	countdown.textContent = `${remaining}s`;
 
 	S.chatMsgBox.appendChild(card);
@@ -355,15 +357,40 @@ export function resolveApproval(requestId: string, decision: string, command: st
 	const params: Record<string, string> = { requestId, decision };
 	if (command) params.command = command;
 	sendRpc("exec.approval.resolve", params).then(() => {
-		card.classList.add("approval-resolved");
-		card.querySelectorAll<HTMLButtonElement>(".approval-btn").forEach((b) => {
-			b.disabled = true;
-		});
-		const status = document.createElement("div");
-		status.className = "approval-status";
-		status.textContent = decision === "approved" ? "Allowed" : "Denied";
-		card.appendChild(status);
+		markApprovalCardResolved(card, decision, false);
 	});
+}
+
+/**
+ * Settle an approval card that was answered somewhere else (external guard, channel
+ * `/approve`, or the request expiring server-side). Does nothing when the card is already
+ * settled, so a local click followed by the broadcast echo is harmless.
+ */
+export function markApprovalResolvedExternally(requestId: string, decision: string): void {
+	if (!S.chatMsgBox) return;
+	const card = document.getElementById(`approval-${requestId}`) as HTMLElement | null;
+	if (card) markApprovalCardResolved(card, decision, true);
+}
+
+function markApprovalCardResolved(card: HTMLElement, decision: string, external: boolean): void {
+	if (card.dataset.approvalSettled === "1") return;
+	card.dataset.approvalSettled = "1";
+	const stored = card.dataset.approvalTimer;
+	if (stored) {
+		clearInterval(Number(stored));
+		delete card.dataset.approvalTimer;
+	}
+	const countdown = card.querySelector(".approval-countdown") as HTMLElement | null;
+	if (countdown) countdown.textContent = "";
+	card.classList.add("approval-resolved");
+	card.querySelectorAll<HTMLButtonElement>(".approval-btn").forEach((b) => {
+		b.disabled = true;
+	});
+	const status = document.createElement("div");
+	status.className = "approval-status";
+	const label = decision === "approved" ? "Allowed" : "Denied";
+	status.textContent = external ? `${label} (auto)` : label;
+	card.appendChild(status);
 }
 
 export function highlightAndScroll(msgEls: (HTMLElement | null)[], messageIndex: number, query: string): void {

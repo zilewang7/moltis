@@ -1,6 +1,6 @@
 // ── Non-chat event handlers ──────────────────────────────────
 
-import { chatAddErrorMsg, renderApprovalCard } from "../chat-ui";
+import { chatAddErrorMsg, markApprovalResolvedExternally, renderApprovalCard } from "../chat-ui";
 import { sendRpc } from "../helpers";
 import { updateLogsAlert } from "../logs-alert";
 import { fetchModels } from "../models";
@@ -8,6 +8,7 @@ import { currentPage, currentPrefix } from "../router";
 import * as S from "../state";
 import type {
 	ApprovalPayload,
+	ApprovalResolvedPayload,
 	AuthCredentialsPayload,
 	LocationRequestPayload,
 	LogEntryPayload,
@@ -17,6 +18,10 @@ import type {
 
 export function handleApprovalEvent(payload: ApprovalPayload): void {
 	renderApprovalCard(payload.requestId, payload.command);
+}
+
+export function handleApprovalResolvedEvent(payload: ApprovalResolvedPayload): void {
+	markApprovalResolvedExternally(payload.requestId, payload.decision || "approved");
 }
 
 export function handleLogEntry(payload: LogEntryPayload): void {

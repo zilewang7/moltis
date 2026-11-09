@@ -6,6 +6,7 @@ export enum WsEventName {
 	Error = "error",
 	AuthCredentialsChanged = "auth.credentials_changed",
 	ExecApprovalRequested = "exec.approval.requested",
+	ExecApprovalResolved = "exec.approval.resolved",
 	LogsEntry = "logs.entry",
 	SandboxPrepare = "sandbox.prepare",
 	SandboxImageBuild = "sandbox.image.build",
@@ -169,6 +170,13 @@ export interface ApprovalPayload {
 	command: string;
 }
 
+export interface ApprovalResolvedPayload {
+	requestId: string;
+	decision?: string;
+	command?: string;
+	sessionKey?: string;
+}
+
 export interface LogEntryPayload {
 	level?: string;
 	[key: string]: unknown;
@@ -250,6 +258,7 @@ export interface WsEventPayloadMap {
 	[WsEventName.Error]: WsErrorPayload;
 	[WsEventName.AuthCredentialsChanged]: AuthCredentialsPayload;
 	[WsEventName.ExecApprovalRequested]: ApprovalPayload;
+	[WsEventName.ExecApprovalResolved]: ApprovalResolvedPayload;
 	[WsEventName.LogsEntry]: LogEntryPayload;
 	[WsEventName.SandboxPrepare]: SandboxPhasePayload;
 	[WsEventName.SandboxImageBuild]: SandboxPhasePayload;

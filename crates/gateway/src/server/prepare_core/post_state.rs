@@ -311,6 +311,38 @@ pub(super) async fn complete_startup(
         vault.clone(),
     );
 
+    // Home patch: announce every resolution on the event stream.
+    //
+    // Without this the web UI only learns about approvals it resolved itself. When an
+    // external guard (or a channel `/approve`) answers a request, the card stays on screen
+    // with a running countdown even though the command already ran.
+    {
+        let hook_state = Arc::clone(&state);
+        approval_manager
+            .set_resolved_hook(Arc::new(move |view, decision| {
+                let state = Arc::clone(&hook_state);
+                let decision = match decision {
+                    moltis_tools::approval::ApprovalDecision::Approved => "approved",
+                    _ => "denied",
+                };
+                tokio::spawn(async move {
+                    crate::broadcast::broadcast(
+                        &state,
+                        "exec.approval.resolved",
+                        serde_json::json!({
+                            "requestId": view.id,
+                            "command": view.command,
+                            "sessionKey": view.session_key,
+                            "decision": decision,
+                        }),
+                        crate::broadcast::BroadcastOpts::default(),
+                    )
+                    .await;
+                });
+            }))
+            .await;
+    }
+
     #[cfg(feature = "connectors")]
     {
         state

@@ -28,6 +28,7 @@ import {
 } from "./ws/sandbox-handlers";
 import {
 	handleApprovalEvent,
+	handleApprovalResolvedEvent,
 	handleAuthCredentialsChanged,
 	handleLocationRequest,
 	handleLogEntry,
@@ -58,6 +59,7 @@ const eventHandlers: Record<string, (payload: Record<string, unknown>, streamMet
 	error: handleWsError as (payload: Record<string, unknown>) => void,
 	"auth.credentials_changed": handleAuthCredentialsChanged as (payload: Record<string, unknown>) => void,
 	"exec.approval.requested": handleApprovalEvent as unknown as (payload: Record<string, unknown>) => void,
+	"exec.approval.resolved": handleApprovalResolvedEvent as unknown as (payload: Record<string, unknown>) => void,
 	"logs.entry": handleLogEntry as (payload: Record<string, unknown>) => void,
 	"sandbox.prepare": handleSandboxPrepare as (payload: Record<string, unknown>) => void,
 	"sandbox.image.build": handleSandboxImageBuild as (payload: Record<string, unknown>) => void,

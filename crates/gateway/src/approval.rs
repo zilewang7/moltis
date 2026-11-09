@@ -93,7 +93,7 @@ impl ExecApprovalService for LiveExecApprovalService {
         let command = params.get("command").and_then(|v| v.as_str());
 
         info!(id, ?decision, "resolving approval request");
-        self.manager.resolve(id, decision, command).await;
+        let _ = self.manager.resolve(id, decision, command).await;
 
         Ok(serde_json::json!({ "ok": true }))
     }

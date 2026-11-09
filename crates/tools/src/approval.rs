@@ -494,6 +494,12 @@ pub struct PendingApprovalView {
     pub session_key: Option<String>,
 }
 
+/// Fired whenever a pending request is resolved, whichever path resolved it (web UI, channel
+/// `/approve`, an external guard over RPC). The gateway installs this hook so it can broadcast
+/// `exec.approval.resolved` -- without it the web UI never learns that someone else already
+/// answered and the approval card sits there until it expires.
+pub type ApprovalResolvedHook = Arc<dyn Fn(PendingApprovalView, ApprovalDecision) + Send + Sync>;
+
 /// The approval manager handles approval flow for exec commands.
 pub struct ApprovalManager {
     pub mode: ApprovalMode,
@@ -502,6 +508,7 @@ pub struct ApprovalManager {
     pub timeout: Duration,
     pending: Arc<RwLock<std::collections::HashMap<String, PendingApproval>>>,
     approved_commands: Arc<RwLock<HashSet<String>>>,
+    resolved_hook: Arc<RwLock<Option<ApprovalResolvedHook>>>,
 }
 
 impl Default for ApprovalManager {
@@ -513,6 +520,7 @@ impl Default for ApprovalManager {
             timeout: Duration::from_secs(120),
             pending: Arc::new(RwLock::new(std::collections::HashMap::new())),
             approved_commands: Arc::new(RwLock::new(HashSet::new())),
+            resolved_hook: Arc::new(RwLock::new(None)),
         }
     }
 }
@@ -649,20 +657,42 @@ impl ApprovalManager {
         (id, rx)
     }
 
+    /// Install the callback fired on every resolution. Called once at gateway startup.
+    pub async fn set_resolved_hook(&self, hook: ApprovalResolvedHook) {
+        *self.resolved_hook.write().await = Some(hook);
+    }
+
     /// Resolve a pending approval request.
-    pub async fn resolve(&self, id: &str, decision: ApprovalDecision, command: Option<&str>) {
-        if let Some(pending) = self.pending.write().await.remove(id) {
-            if decision == ApprovalDecision::Approved && command.is_some() {
-                self.approved_commands
-                    .write()
-                    .await
-                    .insert(pending.command.clone());
-            }
-            let _ = pending.tx.send(decision);
-            debug!(id, "approval resolved");
-        } else {
+    ///
+    /// Returns the resolved request (for logging / broadcasting), or `None` when the id was
+    /// unknown -- which happens when the request already timed out or was resolved twice.
+    pub async fn resolve(
+        &self,
+        id: &str,
+        decision: ApprovalDecision,
+        command: Option<&str>,
+    ) -> Option<PendingApprovalView> {
+        let Some(pending) = self.pending.write().await.remove(id) else {
             warn!(id, "approval resolve: no pending request");
+            return None;
+        };
+        if decision == ApprovalDecision::Approved && command.is_some() {
+            self.approved_commands
+                .write()
+                .await
+                .insert(pending.command.clone());
         }
+        let view = PendingApprovalView {
+            id: id.to_string(),
+            command: pending.command,
+            session_key: pending.session_key,
+        };
+        let _ = pending.tx.send(decision.clone());
+        debug!(id, "approval resolved");
+        if let Some(hook) = self.resolved_hook.read().await.clone() {
+            hook(view.clone(), decision);
+        }
+        Some(view)
     }
 
     /// Return the IDs of all pending approval requests.
@@ -1156,12 +1186,44 @@ EOF\n";
     }
 
     #[tokio::test]
+    async fn resolved_hook_fires_once_per_request() {
+        let manager = ApprovalManager::default();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        manager
+            .set_resolved_hook(Arc::new(move |view, decision| {
+                sink.lock().unwrap().push((view.id, view.command, decision));
+            }))
+            .await;
+
+        let (id, _rx) = manager.create_request("echo hi", Some("session:a")).await;
+        let resolved = manager
+            .resolve(&id, ApprovalDecision::Approved, Some("echo hi"))
+            .await;
+        assert_eq!(resolved.as_ref().map(|view| view.id.as_str()), Some(id.as_str()));
+
+        // Unknown id: no hook, no panic -- this is the double-resolve / timeout case.
+        assert!(
+            manager
+                .resolve(&id, ApprovalDecision::Denied, None)
+                .await
+                .is_none()
+        );
+
+        let events = seen.lock().unwrap().clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, id);
+        assert_eq!(events[0].1, "echo hi");
+        assert_eq!(events[0].2, ApprovalDecision::Approved);
+    }
+
+    #[tokio::test]
     async fn remembered_approval_uses_pending_command_not_caller_value() {
         let manager = ApprovalManager::default();
         let (id, _receiver) = manager
             .create_request("original-command --flag", None)
             .await;
-        manager
+        let _ = manager
             .resolve(
                 &id,
                 ApprovalDecision::Approved,
